@@ -1,5 +1,19 @@
 // Types
 export * from './types/index.js';
+export * from './engine/types.js';
+export {
+  type ResourceProfile,
+  type ResourceProfilePayload,
+  type ModelTier,
+  buildResourceProfile,
+  computeModelTier,
+  computeModelTierFromArch,
+  KATAGO_MAX_CUSTOM_MODEL_BYTES,
+} from './worker/resourceProfile.js';
+export {
+  ENGINE_MAX_VISITS,
+  ENGINE_MAX_TIME_MS,
+} from './engine/limits.js';
 
 // Fast Board & Game Rules
 export {
@@ -59,3 +73,4 @@ export {
   getKataGoEngineClient,
   resetKataGoEngineClient,
 } from './worker/client.js';
+
