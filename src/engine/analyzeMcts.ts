@@ -125,22 +125,31 @@ function takeRecentMoves(
   max: number,
   out: RecentMove[] = []
 ): RecentMove[] {
-  out.length = 0;
-  const pushCopy = (src: RecentMove) => {
-    const idx = out.length;
-    let dst = out[idx];
-    if (!dst) {
-      dst = { move: src.move, player: src.player };
-      out[idx] = dst;
-    } else {
-      dst.move = src.move;
-      dst.player = src.player;
-    }
-    out.length = idx + 1;
-  };
-  for (let i = pathMoves.length - 1; i >= 0 && out.length < max; i--) pushCopy(pathMoves[i]!);
-  for (let i = rootMoves.length - 1; i >= 0 && out.length < max; i--) pushCopy(rootMoves[i]!);
-  out.reverse();
+  const total = pathMoves.length + rootMoves.length;
+  const count = total < max ? total : max;
+  out.length = count;
+
+  let outIdx = 0;
+  const rootCount = count > pathMoves.length ? count - pathMoves.length : 0;
+  const rootStart = rootMoves.length - rootCount;
+  for (let i = rootStart; i < rootMoves.length; i++) {
+    const src = rootMoves[i]!;
+    let dst = out[outIdx];
+    if (!dst) out[outIdx] = { move: src.move, player: src.player };
+    else { dst.move = src.move; dst.player = src.player; }
+    outIdx++;
+  }
+
+  const pathCount = count - rootCount;
+  const pathStart = pathMoves.length - pathCount;
+  for (let i = pathStart; i < pathMoves.length; i++) {
+    const src = pathMoves[i]!;
+    let dst = out[outIdx];
+    if (!dst) out[outIdx] = { move: src.move, player: src.player };
+    else { dst.move = src.move; dst.player = src.player; }
+    outIdx++;
+  }
+
   return out;
 }
 

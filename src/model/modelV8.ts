@@ -283,7 +283,8 @@ function bnAct(x: tf.Tensor4D, bn: TfBn, activation: ActivationKind): tf.Tensor4
 function rmsNormAct(x: tf.Tensor4D, rn: TfRMSNormLayer, activation: ActivationKind): tf.Tensor4D {
   const meanSq = rn.spatial ? tf.mean(tf.square(x), [1, 2, 3], true) : tf.mean(tf.square(x), -1, true);
   const r = tf.rsqrt(tf.add(meanSq, rn.epsilon));
-  const norm = tf.add(tf.mul(tf.mul(x, r), rn.gamma), rn.beta) as tf.Tensor4D;
+  const scale = tf.mul(r, rn.gamma);
+  const norm = tf.add(tf.mul(x, scale), rn.beta) as tf.Tensor4D;
   return applyActivation4D(norm, activation);
 }
 
@@ -291,7 +292,8 @@ function applyTransformerRMSNorm(x: tf.Tensor4D, tr: TfTransformerRMSNorm): tf.T
   if (tr.fuse && x.shape[3] <= 2048 && tf.getBackend() === 'webgpu') return transformerRmsWebGpu(x, tr.weight, tr.epsilon);
   const meanSq = tf.mean(tf.square(x), -1, true);
   const r = tf.rsqrt(tf.add(meanSq, tr.epsilon));
-  return tf.mul(tf.mul(x, r), tr.weight) as tf.Tensor4D;
+  const scale = tf.mul(r, tr.weight);
+  return tf.mul(x, scale) as tf.Tensor4D;
 }
 
 function forwardAttention(x: tf.Tensor4D, attn: TfTransformerAttention): tf.Tensor4D {
@@ -326,8 +328,7 @@ function forwardAttention(x: tf.Tensor4D, attn: TfTransformerAttention): tf.Tens
     }
 
     const qPair = Q.reshape([N, attn.numHeads, S, numPairs, 2]);
-    const q0 = qPair.slice([0, 0, 0, 0, 0], [-1, -1, -1, -1, 1]).reshape([N, attn.numHeads, S, numPairs]);
-    const q1 = qPair.slice([0, 0, 0, 0, 1], [-1, -1, -1, -1, 1]).reshape([N, attn.numHeads, S, numPairs]);
+    const [q0, q1] = tf.unstack(qPair, -1);
     const qRot0 = tf.sub(tf.mul(q0, cosQ), tf.mul(q1, sinQ));
     const qRot1 = tf.add(tf.mul(q0, sinQ), tf.mul(q1, cosQ));
     Q = tf.stack([qRot0, qRot1], -1).reshape([N, attn.numHeads, S, attn.qHeadDim]) as tf.Tensor4D;
@@ -335,8 +336,7 @@ function forwardAttention(x: tf.Tensor4D, attn: TfTransformerAttention): tf.Tens
     const cosK = attn.rope.cos;
     const sinK = attn.rope.sin;
     const kPair = K.reshape([N, attn.numKVHeads, S, numPairs, 2]);
-    const k0 = kPair.slice([0, 0, 0, 0, 0], [-1, -1, -1, -1, 1]).reshape([N, attn.numKVHeads, S, numPairs]);
-    const k1 = kPair.slice([0, 0, 0, 0, 1], [-1, -1, -1, -1, 1]).reshape([N, attn.numKVHeads, S, numPairs]);
+    const [k0, k1] = tf.unstack(kPair, -1);
     const kRot0 = tf.sub(tf.mul(k0, cosK), tf.mul(k1, sinK));
     const kRot1 = tf.add(tf.mul(k0, sinK), tf.mul(k1, cosK));
     K = tf.stack([kRot0, kRot1], -1).reshape([N, attn.numKVHeads, S, attn.qHeadDim]) as tf.Tensor4D;
@@ -348,7 +348,8 @@ function forwardAttention(x: tf.Tensor4D, attn: TfTransformerAttention): tf.Tens
     V = V.reshape([N, attn.numKVHeads, 1, S, attn.vHeadDim]).tile([1, 1, g, 1, 1]).reshape([N, attn.numHeads, S, attn.vHeadDim]) as tf.Tensor4D;
   }
 
-  const scores = tf.matMul(Q, K, false, true).mul(attn.scale);
+  const qScaled = tf.mul(Q, attn.scale);
+  const scores = tf.matMul(qScaled, K, false, true);
   const weights = tf.softmax(scores, -1);
   const context = tf.matMul(weights, V);
 
@@ -386,20 +387,19 @@ function conv2d(x: tf.Tensor4D, conv: TfConv): tf.Tensor4D {
 function poolRowsGPool(x: tf.Tensor4D): tf.Tensor2D {
   // KataGo gpool: concat(mean, mean * (sqrt(div)-14)*0.1, max).
   const boardSize = x.shape[1] ?? 19;
-  const factor = (boardSize - 14) * 0.1;
+  const factor = boardSize === 19 ? 0.5 : (boardSize - 14) * 0.1;
   const mean = tf.mean(x, [1, 2]) as tf.Tensor2D; // [N,C]
   const max = tf.max(x, [1, 2]) as tf.Tensor2D; // [N,C]
-  return tf.concat([mean, mean.mul(factor), max], 1) as tf.Tensor2D;
+  return tf.concat([mean, tf.mul(mean, factor), max], 1) as tf.Tensor2D;
 }
 
 function poolRowsValueHead(x: tf.Tensor4D): tf.Tensor2D {
   // KataGo value pooling: concat(mean, mean * (sqrt(div)-14)*0.1, mean * (((sqrt(div)-14)^2)*0.01 - 0.1)).
   const boardSize = x.shape[1] ?? 19;
-  const base = boardSize - 14;
-  const factor1 = base * 0.1;
-  const factor2 = base * base * 0.01 - 0.1;
+  const factor1 = boardSize === 19 ? 0.5 : (boardSize - 14) * 0.1;
+  const factor2 = boardSize === 19 ? 0.15 : (boardSize - 14) * (boardSize - 14) * 0.01 - 0.1;
   const mean = tf.mean(x, [1, 2]) as tf.Tensor2D; // [N,C]
-  return tf.concat([mean, mean.mul(factor1), mean.mul(factor2)], 1) as tf.Tensor2D;
+  return tf.concat([mean, tf.mul(mean, factor1), tf.mul(mean, factor2)], 1) as tf.Tensor2D;
 }
 
 export type ParsedTrunkBlock =
