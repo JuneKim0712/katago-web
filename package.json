@@ -17,6 +17,7 @@
       "require": "./dist/worker/worker.cjs"
     }
   },
+  "type": "module",
   "files": [
     "dist",
     "README.md",
@@ -25,7 +26,10 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "bench": "vitest run test/performance.test.ts",
+    "parity": "vitest run test/nativeParity.test.ts",
+    "generate:parity": "node scripts/generate-katago-parity.mjs"
   },
   "keywords": [
     "katago",

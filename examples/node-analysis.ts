@@ -23,9 +23,15 @@ async function main() {
   console.log(`Backend initialized: ${tf.getBackend()}`);
 
   // 2. Load Model
-  const modelPath = process.env.MODEL_PATH ?? resolve('../baduk/public/models/katago-small.bin.gz');
-  if (!existsSync(modelPath)) {
-    console.error(`Model file not found at ${modelPath}. Set MODEL_PATH env variable.`);
+  const defaultModelPaths = [
+    process.env.MODEL_PATH,
+    'C:/Users/junwo/Downloads/kata1-tf2-b10c384-s2941M-d5872M.bin.gz',
+    resolve('models/kata1-tf2-b10c384-s2941M-d5872M.bin.gz'),
+    resolve('../baduk/public/models/katago-small.bin.gz'),
+  ];
+  const modelPath = defaultModelPaths.find((p) => p && existsSync(p));
+  if (!modelPath) {
+    console.error(`Model file not found. Place kata1-tf2-b10c384-s2941M-d5872M.bin.gz or set MODEL_PATH.`);
     process.exit(1);
   }
   console.log(`Loading model from: ${modelPath}`);

@@ -134,13 +134,32 @@ katago-web
 
 ## Verification & Testing
 
-The package includes parity tests that execute against official native KataGo v1.18.1 outputs across multiple game positions (opening, captures, passes, and various rule sets):
+### 1. Rigorous Native KataGo v1.18.1 Parity Suite (`kata1-b10c384`)
+The package includes an extensive test suite verifying mathematical and bitwise parity against official native KataGo v1.18.1 with the high-capacity `kata1-tf2-b10c384-s2941M-d5872M.bin.gz` network (10 blocks, 384 channels, Transformer attention, rotary embeddings):
+- **Win Rate & Lead**: Evaluates black win probability ($\Delta < 0.0002$), score lead ($\Delta < 0.01$ pts), and selfplay score variance.
+- **Full Policy Distribution**: Compares all 361 board coordinates + pass move ($\Delta < 0.0003$).
+- **Top Move Selection & Ordering**: Verifies that the top-5 policy move choices and ranking orders match native KataGo 100%.
+- **Complex Edge Cases**: Tests Japanese vs Chinese rules, pass moves, multi-stone captures, active ko fights (`koPoint` legality masking), running ladders, and 9-stone handicap games.
+- **Multi-Batch Equivalence**: Proves single-sample vs batched inference ($B=4$) are bitwise equivalent.
 
 ```bash
-npm test
+npm run parity
 ```
 
-Build standalone distribution packages:
+### 2. Performance Benchmarking
+Measure forward inference latency and pipelined MCTS visit speed:
+```bash
+npm run bench
+```
+
+### 3. Generate Parity Fixtures
+Regenerate ground-truth fixtures directly from an official native KataGo executable:
+```bash
+npm run generate:parity [path/to/katago.exe] [path/to/model.bin.gz]
+```
+
+### 4. Build Distribution
+Build ESM and CommonJS bundles with TypeScript `.d.ts` declaration maps:
 ```bash
 npm run build
 ```
