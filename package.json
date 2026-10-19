@@ -1,0 +1,54 @@
+{
+  "name": "katago-web",
+  "version": "1.0.0",
+  "description": "High-performance KataGo AI analysis and neural network inference in pure TypeScript / WebGPU / WASM",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./worker": {
+      "types": "./dist/worker/worker.d.ts",
+      "import": "./dist/worker/worker.js",
+      "require": "./dist/worker/worker.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "katago",
+    "baduk",
+    "go",
+    "ai",
+    "mcts",
+    "tensorflowjs",
+    "webgpu",
+    "wasm"
+  ],
+  "author": "junwoo",
+  "license": "MIT",
+  "dependencies": {
+    "@tensorflow/tfjs": "^4.22.0",
+    "@tensorflow/tfjs-backend-wasm": "^4.22.0",
+    "@tensorflow/tfjs-backend-webgpu": "^4.22.0",
+    "pako": "^2.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.13",
+    "@types/pako": "^2.0.4",
+    "typescript": "~5.9.3",
+    "vitest": "^4.1.8"
+  }
+}

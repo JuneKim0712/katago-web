@@ -1,0 +1,7 @@
+[
+  { "id": "empty-japanese", "rules": "japanese", "komi": 7.5, "currentPlayer": "black", "moves": [] },
+  { "id": "opening-white", "rules": "japanese", "komi": 6.5, "currentPlayer": "white", "moves": [["black", "D4"], ["white", "Q16"], ["black", "Q4"], ["white", "D16"], ["black", "C14"]] },
+  { "id": "capture-chinese", "rules": "chinese", "komi": 7.5, "currentPlayer": "white", "moves": [["black", "B2"], ["white", "A2"], ["black", "A3"], ["white", "Q16"], ["black", "A1"]] },
+  { "id": "capture-japanese", "rules": "japanese", "komi": 6.5, "currentPlayer": "white", "moves": [["black", "B2"], ["white", "A2"], ["black", "A3"], ["white", "Q16"], ["black", "A1"]] },
+  { "id": "pass-japanese", "rules": "japanese", "komi": 6.5, "currentPlayer": "white", "moves": [["black", "D4"], ["white", "pass"], ["black", "Q16"]] }
+]
