@@ -28,6 +28,8 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "bench": "vitest run test/performance.test.ts",
+    "test:perf": "vitest run test/visitSpeed.test.ts",
+    "bench:visits": "vitest run test/visitSpeed.test.ts",
     "parity": "vitest run test/nativeParity.test.ts",
     "generate:parity": "node scripts/generate-katago-parity.mjs"
   },
