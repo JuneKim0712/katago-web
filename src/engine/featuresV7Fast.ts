@@ -1,6 +1,15 @@
 import type { GameRules, Player } from '../types/index.js';
 import { getOpponent } from '../utils/helpers.js';
-import { BLACK, WHITE, EMPTY, PASS_MOVE, BOARD_SIZE, computeLibertyMap, computeAreaMapV7KataGo, type StoneColor } from './fastBoard.js';
+import {
+  BLACK,
+  WHITE,
+  EMPTY,
+  PASS_MOVE,
+  BOARD_SIZE,
+  computeLibertyMap,
+  computeAreaMapV7KataGo,
+  type StoneColor,
+} from './fastBoard.js';
 
 const INPUT_SPATIAL_CHANNELS_V7 = 22;
 const INPUT_GLOBAL_CHANNELS_V7 = 19;
@@ -15,7 +24,8 @@ export type RecentMove = {
   player: Player;
 };
 
-const idxNHWC = (x: number, y: number, c: number) => ((y * BOARD_SIZE + x) * INPUT_SPATIAL_CHANNELS_V7 + c);
+export const idxNHWC = (x: number, y: number, c: number) =>
+  (y * BOARD_SIZE + x) * INPUT_SPATIAL_CHANNELS_V7 + c;
 
 function playerToColor(p: Player): StoneColor {
   return p === 'black' ? BLACK : WHITE;
@@ -50,57 +60,52 @@ export function fillInputsV7Fast(args: {
   spatial.fill(0);
   global.fill(0);
 
-  for (let pos = 0; pos < BOARD_SIZE * BOARD_SIZE; pos++) spatial[pos * INPUT_SPATIAL_CHANNELS_V7 + 0] = 1.0;
+  const totalPoints = BOARD_SIZE * BOARD_SIZE;
 
-  if (koPoint >= 0 && koPoint < BOARD_SIZE * BOARD_SIZE) {
-    const x = koPoint % BOARD_SIZE;
-    const y = (koPoint / BOARD_SIZE) | 0;
-    spatial[idxNHWC(x, y, 6)] = 1.0;
+  // Ko point (plane 6)
+  if (koPoint >= 0 && koPoint < totalPoints) {
+    spatial[koPoint * INPUT_SPATIAL_CHANNELS_V7 + 6] = 1.0;
   }
 
   const libs = args.libertyMap ?? computeLibertyMap(stones);
+  const l0 = args.ladderedStones;
+  const l1 = args.prevLadderedStones;
+  const l2 = args.prevPrevLadderedStones;
+  const lm = args.ladderWorkingMoves;
+  const hasLadders = Boolean(l0 || l1 || l2 || lm);
+  const area = rules === 'chinese' ? (args.areaMap ?? computeAreaMapV7KataGo(stones)) : undefined;
 
-  for (let y = 0; y < BOARD_SIZE; y++) {
-    for (let x = 0; x < BOARD_SIZE; x++) {
-      const pos = y * BOARD_SIZE + x;
-      const v = stones[pos] as StoneColor;
-      if (v === EMPTY) continue;
-      if (v === plaColor) spatial[idxNHWC(x, y, 1)] = 1.0;
-      else if (v === oppColor) spatial[idxNHWC(x, y, 2)] = 1.0;
+  // Unified single-pass loop over all board points for maximum memory locality & zero redundant math
+  for (let pos = 0; pos < totalPoints; pos++) {
+    const base = pos * INPUT_SPATIAL_CHANNELS_V7;
+    // Plane 0: constant 1.0
+    spatial[base] = 1.0;
 
+    const v = stones[pos] as StoneColor;
+    if (v === plaColor) {
+      spatial[base + 1] = 1.0;
+    } else if (v === oppColor) {
+      spatial[base + 2] = 1.0;
+    }
+
+    if (v !== EMPTY) {
       const l = libs[pos]!;
-      if (l === 1) spatial[idxNHWC(x, y, 3)] = 1.0;
-      else if (l === 2) spatial[idxNHWC(x, y, 4)] = 1.0;
-      else if (l === 3) spatial[idxNHWC(x, y, 5)] = 1.0;
+      if (l === 1) spatial[base + 3] = 1.0;
+      else if (l === 2) spatial[base + 4] = 1.0;
+      else if (l === 3) spatial[base + 5] = 1.0;
     }
-  }
 
-  if (args.ladderedStones || args.prevLadderedStones || args.prevPrevLadderedStones || args.ladderWorkingMoves) {
-    const l0 = args.ladderedStones;
-    const l1 = args.prevLadderedStones;
-    const l2 = args.prevPrevLadderedStones;
-    const lm = args.ladderWorkingMoves;
-
-    for (let y = 0; y < BOARD_SIZE; y++) {
-      for (let x = 0; x < BOARD_SIZE; x++) {
-        const pos = y * BOARD_SIZE + x;
-        if (l0 && l0[pos]) spatial[idxNHWC(x, y, 14)] = 1.0;
-        if (l1 && l1[pos]) spatial[idxNHWC(x, y, 15)] = 1.0;
-        if (l2 && l2[pos]) spatial[idxNHWC(x, y, 16)] = 1.0;
-        if (lm && lm[pos]) spatial[idxNHWC(x, y, 17)] = 1.0;
-      }
+    if (hasLadders) {
+      if (l0 && l0[pos]) spatial[base + 14] = 1.0;
+      if (l1 && l1[pos]) spatial[base + 15] = 1.0;
+      if (l2 && l2[pos]) spatial[base + 16] = 1.0;
+      if (lm && lm[pos]) spatial[base + 17] = 1.0;
     }
-  }
 
-  if (rules === 'chinese') {
-    const area = args.areaMap ?? computeAreaMapV7KataGo(stones);
-    for (let y = 0; y < BOARD_SIZE; y++) {
-      for (let x = 0; x < BOARD_SIZE; x++) {
-        const pos = y * BOARD_SIZE + x;
-        const v = area[pos] as StoneColor;
-        if (v === plaColor) spatial[idxNHWC(x, y, 18)] = 1.0;
-        else if (v === oppColor) spatial[idxNHWC(x, y, 19)] = 1.0;
-      }
+    if (area) {
+      const av = area[pos] as StoneColor;
+      if (av === plaColor) spatial[base + 18] = 1.0;
+      else if (av === oppColor) spatial[base + 19] = 1.0;
     }
   }
 
@@ -120,10 +125,8 @@ export function fillInputsV7Fast(args: {
       if (m.player !== expectedPlayers[i]) break;
       if (m.move === PASS_MOVE) {
         global[passGlobals[i]] = 1.0;
-      } else {
-        const x = m.move % BOARD_SIZE;
-        const y = (m.move / BOARD_SIZE) | 0;
-        spatial[idxNHWC(x, y, historyPlanes[i])] = 1.0;
+      } else if (m.move >= 0 && m.move < totalPoints) {
+        spatial[m.move * INPUT_SPATIAL_CHANNELS_V7 + historyPlanes[i]] = 1.0;
       }
     }
   }

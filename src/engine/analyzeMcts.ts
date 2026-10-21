@@ -1657,11 +1657,13 @@ function dispatchEvalBatchAsync(args: {
   const areaMapScratch = includeAreaFeature ? scratch.areaMapScratch!.subarray(0, batch * BOARD_AREA) : null;
   const symmetries = scratch.symmetries.subarray(0, batch);
 
-  // Pass subarrays directly without cloning — tf.tensor copies input bytes synchronously.
-  const spatialTensor = tf.tensor4d(spatialBatch, [batch, BOARD_SIZE, BOARD_SIZE, 22]);
-  const globalTensor = tf.tensor2d(globalBatch, [batch, 19]);
-
   return (async () => {
+    const { spatial: spatialTensor, global: globalTensor, disposeInputs } = await createInputTensors(
+      model,
+      spatialBatch,
+      globalBatch,
+      batch
+    );
     let out: ReturnType<KataGoModelV8Tf['forwardPolicyValue']> | ReturnType<KataGoModelV8Tf['forward']> | undefined;
     const readOutputs = async () => {
       try {
@@ -1677,8 +1679,10 @@ function dispatchEvalBatchAsync(args: {
     let values: Awaited<ReturnType<typeof readOutputs>>;
     try { values = await readOutputs(); }
     finally {
-      spatialTensor.dispose();
-      globalTensor.dispose();
+      if (disposeInputs) {
+        spatialTensor.dispose();
+        globalTensor.dispose();
+      }
     }
     const [policyArr, passArr, valueArr, scoreArr, ownershipArr] = values;
 
@@ -1787,6 +1791,13 @@ export class MctsSearch {
   private libertyMapStack: Uint8Array[] = [];
   private libertySeedsScratch = new Int16Array(BOARD_AREA * 5);
   private treeOwnershipCache: { visits: number; ownership: Float32Array; ownershipStdev: Float32Array; timestamp: number } | null = null;
+  private readonly simScratch: SimPosition = { stones: new Uint8Array(BOARD_AREA), koPoint: -1 };
+  private readonly captureStackScratch: number[] = [];
+  private readonly undoMovesScratch: number[] = [];
+  private readonly undoPlayersScratch: StoneColor[] = [];
+  private readonly undoSnapshotsScratch: UndoSnapshot[] = [];
+  private readonly pathMovesScratch: RecentMove[] = [];
+  private readonly searchPathNodesScratch: Node[] = [];
 
   private constructor(args: {
     model: KataGoModelV8Tf;
@@ -1849,6 +1860,11 @@ export class MctsSearch {
     this.rootSelfScoreMean = args.rootSelfScoreMean;
     this.rootSelfScoreMeanSq = args.rootSelfScoreMeanSq;
     this.rootSelfUtility = args.rootSelfUtility;
+
+    // Pre-allocate liberty maps up to max tree depth so traversals never allocate
+    while (this.libertyMapStack.length < 64) {
+      this.libertyMapStack.push(new Uint8Array(BOARD_AREA));
+    }
   }
 
   static async create(args: {
@@ -1993,12 +2009,13 @@ export class MctsSearch {
     if (this.jobPrevPrevLibertyMapScratch.length < neededBoardCapacity)
       this.jobPrevPrevLibertyMapScratch = new Uint8Array(neededBoardCapacity);
 
-    const sim: SimPosition = { stones: this.rootStones.slice(), koPoint: this.rootKoPoint };
-    const captureStack: number[] = [];
-    const undoMoves: number[] = [];
-    const undoPlayers: StoneColor[] = [];
-    const undoSnapshots: UndoSnapshot[] = [];
-    const pathMoves: RecentMove[] = [];
+    const sim: SimPosition = this.simScratch;
+    sim.koPoint = this.rootKoPoint;
+    const captureStack = this.captureStackScratch;
+    const undoMoves = this.undoMovesScratch;
+    const undoPlayers = this.undoPlayersScratch;
+    const undoSnapshots = this.undoSnapshotsScratch;
+    const pathMoves = this.pathMovesScratch;
     const libertyMapStack = this.libertyMapStack;
     libertyMapStack[0] = this.rootLibertyMap;
     const libertySeedsScratch = this.libertySeedsScratch;
@@ -2061,7 +2078,9 @@ export class MctsSearch {
         libertyMapStack[0] = this.rootLibertyMap;
         let depth = 0;
 
-        const path: Node[] = [this.rootNode];
+        const path = this.searchPathNodesScratch;
+        path.length = 1;
+        path[0] = this.rootNode;
         let node = this.rootNode;
         let player = this.rootNode.playerToMove;
 
@@ -2201,7 +2220,7 @@ export class MctsSearch {
         jobList.push({
           komi: getNNKomi(this.nnKomi, this.rules, pathMoves),
           leaf: node,
-          path,
+          path: path.slice(),
           stones: leafStones,
           koPoint: leafKoPoint,
           libertyMap: leafLibertyBuf,
