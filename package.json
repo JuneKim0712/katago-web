@@ -30,6 +30,8 @@
     "bench": "vitest run test/performance.test.ts",
     "test:perf": "vitest run test/visitSpeed.test.ts",
     "bench:visits": "vitest run test/visitSpeed.test.ts",
+    "bench:webgpu": "node benchmarks/run-bench.mjs",
+    "test:webgpu:parity": "playwright test test/browser/webgpu-parity.spec.ts",
     "parity": "vitest run test/nativeParity.test.ts",
     "generate:parity": "node scripts/generate-katago-parity.mjs"
   },
@@ -54,6 +56,7 @@
   "devDependencies": {
     "@types/node": "^24.10.13",
     "@types/pako": "^2.0.4",
+    "fast-check": "4.10.2",
     "typescript": "~5.9.3",
     "vitest": "^4.1.8"
   }

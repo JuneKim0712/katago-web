@@ -1,14 +1,39 @@
 import * as tf from '@tensorflow/tfjs';
 import type { BoardState, FloatArray, GameRules, Move, Player, RegionOfInterest } from '../types/index.js';
 import { getAnimationNow } from '../utils/helpers.js';
+import { type RandomSource, DefaultRandomSource, Rand } from '../utils/random.js';
+import { type ClockSource, DefaultClockSource } from '../utils/clock.js';
 import { postprocessKataGoV8 } from './evalV8.js';
+import { processNeuralOutputs, EvaluationContext } from './evaluation/batch.js';
+import { FeatureCache } from './features/cache.js';
+import type { EvalState, NeuralEval, EvalBatchScratch } from './evaluation/types.js';
+export type { NeuralEval } from './evaluation/types.js';
 import type { KataGoModelV8Tf } from '../model/modelV8.js';
 import { expectedWhiteScoreValue, getSqrtBoardArea } from './scoreValue.js';
 import { ENGINE_MAX_TIME_MS, ENGINE_MAX_VISITS } from './limits.js';
+import { Node, type Edge } from './search/tree.js';
+import {
+  computeRecentScoreCenter,
+  computeBlackUtilityFromEval,
+  computeWeightedRootStats,
+  type ChildWeightStats,
+  type RootSelfStats,
+} from './search/utility.js';
+import { selectEdge } from './search/selection.js';
+import { expandNode, getExpandScratch } from './search/expansion.js';
+import {
+  moveToGtp,
+  buildPv,
+  getPvForEdge,
+  averageTreeOwnership,
+} from './search/report.js';
+
+export { moveToGtp };
 import {
   BLACK,
   WHITE,
   EMPTY,
+  EMPTY_AREA_MAP,
   BOARD_AREA,
   BOARD_SIZE,
   PASS_MOVE,
@@ -17,6 +42,7 @@ import {
   NEIGHBOR_STARTS,
   opponentOf,
   playMove,
+  playMoveInto,
   undoMove,
   computeLadderFeaturesV7KataGoInto,
   computeLadderedStonesV7KataGoInto,
@@ -46,58 +72,6 @@ const hasOwnership = (out: PolicyValueOutput | PolicyValueOwnershipOutput): out 
   return 'ownership' in out;
 };
 
-type Edge = {
-  move: number; // 0..360 or PASS_MOVE
-  prior: number;
-  child: Node | null;
-  pvCache?: { visits: number; depth: number; pv: string[] };
-};
-
-type ExpandScratch = {
-  moves: Int16Array;
-  logits: Float32Array;
-  priors: Float64Array;
-  topMoves: Int16Array;
-  topPriors: Float64Array;
-  order: number[];
-};
-
-let expandScratch: ExpandScratch | null = null;
-let expandScratchBoardArea = 0;
-const getExpandScratch = (): ExpandScratch => {
-  if (!expandScratch || expandScratchBoardArea !== BOARD_AREA) {
-    expandScratch = {
-      moves: new Int16Array(BOARD_AREA),
-      logits: new Float32Array(BOARD_AREA),
-      priors: new Float64Array(BOARD_AREA),
-      topMoves: new Int16Array(BOARD_AREA),
-      topPriors: new Float64Array(BOARD_AREA),
-      order: [],
-    };
-    expandScratchBoardArea = BOARD_AREA;
-  }
-  return expandScratch;
-};
-
-class Node {
-  readonly playerToMove: StoneColor;
-  visits = 0;
-  valueSum = 0; // [-1,1] where +1 is black win
-  scoreLeadSum = 0; // black lead
-  scoreMeanSum = 0; // black score mean
-  scoreMeanSqSum = 0; // sum of (stdev^2 + mean^2) for mixture stdev
-  utilitySum = 0; // from black perspective
-  utilitySqSum = 0; // from black perspective
-  nnUtility: number | null = null; // direct NN eval utility, from black perspective
-  ownership: Float32Array | null = null; // len 361, +1 black owns, -1 white owns
-  inFlight = 0;
-  pendingEval = false;
-  edges: Edge[] | null = null;
-
-  constructor(playerToMove: StoneColor) {
-    this.playerToMove = playerToMove;
-  }
-}
 
 function playerToColor(p: Player): StoneColor {
   return p === 'black' ? BLACK : WHITE;
@@ -123,14 +97,16 @@ function takeRecentMoves(
   rootMoves: RecentMove[],
   pathMoves: RecentMove[],
   max: number,
-  out: RecentMove[] = []
+  out: RecentMove[] = [],
+  pathMovesCount?: number
 ): RecentMove[] {
-  const total = pathMoves.length + rootMoves.length;
+  const pCount = pathMovesCount ?? pathMoves.length;
+  const total = pCount + rootMoves.length;
   const count = total < max ? total : max;
   out.length = count;
 
   let outIdx = 0;
-  const rootCount = count > pathMoves.length ? count - pathMoves.length : 0;
+  const rootCount = count > pCount ? count - pCount : 0;
   const rootStart = rootMoves.length - rootCount;
   for (let i = rootStart; i < rootMoves.length; i++) {
     const src = rootMoves[i]!;
@@ -141,8 +117,8 @@ function takeRecentMoves(
   }
 
   const pathCount = count - rootCount;
-  const pathStart = pathMoves.length - pathCount;
-  for (let i = pathStart; i < pathMoves.length; i++) {
+  const pathStart = pCount - pathCount;
+  for (let i = pathStart; i < pCount; i++) {
     const src = pathMoves[i]!;
     let dst = out[outIdx];
     if (!dst) out[outIdx] = { move: src.move, player: src.player };
@@ -178,143 +154,6 @@ function buildAllowedMovesMask(roi?: RegionOfInterest | null): Uint8Array | null
   return allowed;
 }
 
-function expandNode(args: {
-  node: Node;
-  stones: Uint8Array;
-  koPoint: number;
-  policyLogits: ArrayLike<number>; // len 361 (in symmetry space if policyLogitsSymmetry != 0)
-  policyLogitsSymmetry?: number; // 0..7, where 0 is identity
-  passLogit: number;
-  maxChildren: number;
-  libertyMap?: Uint8Array;
-  allowedMoves?: Uint8Array;
-  policyOut?: Float32Array; // len 362, illegal = -1, pass at index 361
-  policyOutputScaling?: number;
-}): void {
-  const { node, stones, koPoint, policyLogits, passLogit, maxChildren } = args;
-  const policyScale = args.policyOutputScaling ?? 1.0;
-  const pla = node.playerToMove;
-  const opp = opponentOf(pla);
-  const sym = args.policyLogitsSymmetry ?? 0;
-  const symOff = sym * BOARD_AREA;
-  const symPosMap = sym === 0 ? null : getSymPosMap();
-
-  const libs = args.libertyMap ?? computeLibertyMap(stones);
-
-  const scratch = getExpandScratch();
-  const movesScratch = scratch.moves;
-  const logitsScratch = scratch.logits;
-  const priorsScratch = scratch.priors;
-  let moveCount = 0;
-  const passLogitScaled = passLogit * policyScale;
-  let maxLogit = passLogitScaled;
-  const allowedMoves = args.allowedMoves;
-  for (let p = 0; p < BOARD_AREA; p++) {
-    if (allowedMoves && allowedMoves[p] === 0) continue;
-    if (stones[p] !== EMPTY) continue;
-    if (p === koPoint) continue;
-
-    let hasEmptyNeighbor = false;
-    let captures = false;
-    let connectsToSafeGroup = false;
-
-    const nStart = NEIGHBOR_STARTS[p]!;
-    const nCount = NEIGHBOR_COUNTS[p]!;
-
-    for (let i = 0; i < nCount; i++) {
-      const n = NEIGHBOR_LIST[nStart + i]!;
-      const c = stones[n] as StoneColor;
-      if (c === EMPTY) {
-        hasEmptyNeighbor = true;
-        break;
-      }
-      if (c === opp) {
-        if (libs[n] === 1) {
-          captures = true;
-          break;
-        }
-        continue;
-      }
-      if (c === pla && libs[n] > 1) {
-        connectsToSafeGroup = true;
-        break;
-      }
-    }
-
-    if (!hasEmptyNeighbor && !captures && !connectsToSafeGroup) continue;
-    const symPos = sym === 0 ? p : symPosMap![symOff + p]!;
-    const logit = policyLogits[symPos]! * policyScale;
-    movesScratch[moveCount] = p;
-    logitsScratch[moveCount] = logit;
-    if (logit > maxLogit) maxLogit = logit;
-    moveCount++;
-  }
-
-  let sum = 0;
-  for (let i = 0; i < moveCount; i++) {
-    const v = Math.exp(logitsScratch[i]! - maxLogit);
-    priorsScratch[i] = v;
-    sum += v;
-  }
-  const passPriorRaw = Math.exp(passLogitScaled - maxLogit);
-  sum += passPriorRaw;
-  const invSum = 1.0 / sum;
-  for (let i = 0; i < moveCount; i++) priorsScratch[i] *= invSum;
-  const passPrior = passPriorRaw * invSum;
-
-  if (args.policyOut) {
-    const out = args.policyOut;
-    out.fill(-1);
-    for (let i = 0; i < moveCount; i++) out[movesScratch[i]!] = priorsScratch[i]! as number;
-    out[PASS_MOVE] = passPrior as number;
-  }
-
-  const topMoves = scratch.topMoves;
-  const topPriors = scratch.topPriors;
-  const maxKids = Math.max(0, maxChildren);
-  let topCount = 0;
-  let minIdx = 0;
-  for (let i = 0; i < moveCount; i++) {
-    const prior = priorsScratch[i]!;
-    if (topCount < maxKids) {
-      topMoves[topCount] = movesScratch[i]!;
-      topPriors[topCount] = prior;
-      topCount++;
-      if (topCount === maxKids) {
-        minIdx = 0;
-        for (let j = 1; j < topCount; j++) {
-          if (topPriors[j]! < topPriors[minIdx]!) minIdx = j;
-        }
-      }
-    } else if (maxKids > 0 && prior > topPriors[minIdx]!) {
-      topMoves[minIdx] = movesScratch[i]!;
-      topPriors[minIdx] = prior;
-      minIdx = 0;
-      for (let j = 1; j < topCount; j++) {
-        if (topPriors[j]! < topPriors[minIdx]!) minIdx = j;
-      }
-    }
-  }
-
-  const order = scratch.order;
-  order.length = topCount;
-  for (let i = 0; i < topCount; i++) order[i] = i;
-  order.sort((a, b) => {
-    const diff = topPriors[b]! - topPriors[a]!;
-    if (diff !== 0) return diff;
-    return topMoves[a]! - topMoves[b]!;
-  });
-
-  const edges: Edge[] = new Array(topCount + 1);
-  let edgeIdx = 0;
-  for (let i = 0; i < order.length; i++) {
-    const idx = order[i]!;
-    edges[edgeIdx++] = { move: topMoves[idx]!, prior: topPriors[idx]!, child: null };
-  }
-  edges[edgeIdx++] = { move: PASS_MOVE, prior: passPrior, child: null };
-
-  node.edges = edges;
-}
 
 async function buildRootEval(args: {
   model: KataGoModelV8Tf;
@@ -425,289 +264,6 @@ async function buildRootEval(args: {
 }
 
 // Mirrors KataGo config "Internal params" defaults (see cpp/configs/*_example.cfg).
-const WIN_LOSS_UTILITY_FACTOR: number = 1.0;
-const STATIC_SCORE_UTILITY_FACTOR: number = 0.1;
-const DYNAMIC_SCORE_UTILITY_FACTOR: number = 0.3;
-const DYNAMIC_SCORE_CENTER_ZERO_WEIGHT: number = 0.2;
-const DYNAMIC_SCORE_CENTER_SCALE: number = 0.75;
-const NO_RESULT_UTILITY_FOR_WHITE: number = 0.0;
-
-function computeRecentScoreCenter(expectedWhiteScore: number): number {
-  let recentScoreCenter = expectedWhiteScore * (1.0 - DYNAMIC_SCORE_CENTER_ZERO_WEIGHT);
-  const cap = getSqrtBoardArea() * DYNAMIC_SCORE_CENTER_SCALE;
-  if (recentScoreCenter > expectedWhiteScore + cap) recentScoreCenter = expectedWhiteScore + cap;
-  if (recentScoreCenter < expectedWhiteScore - cap) recentScoreCenter = expectedWhiteScore - cap;
-  return recentScoreCenter;
-}
-
-function computeBlackUtilityFromEval(args: {
-  blackWinProb: number;
-  blackNoResultProb: number;
-  blackScoreMean: number;
-  blackScoreStdev: number;
-  recentScoreCenter: number; // white score center
-}): number {
-  const sqrtBoardArea = getSqrtBoardArea();
-  const blackLossProb = 1.0 - args.blackWinProb - args.blackNoResultProb;
-  const whiteWinLossValue = blackLossProb - args.blackWinProb;
-  const whiteScoreMean = -args.blackScoreMean;
-  const whiteScoreStdev = args.blackScoreStdev;
-
-  const staticScoreValue = expectedWhiteScoreValue({
-    whiteScoreMean,
-    whiteScoreStdev,
-    center: 0.0,
-    scale: 2.0,
-    sqrtBoardArea,
-  });
-
-  const dynamicScoreValue =
-    DYNAMIC_SCORE_UTILITY_FACTOR === 0.0
-      ? 0.0
-      : expectedWhiteScoreValue({
-          whiteScoreMean,
-          whiteScoreStdev,
-          center: args.recentScoreCenter,
-          scale: DYNAMIC_SCORE_CENTER_SCALE,
-          sqrtBoardArea,
-        });
-
-  const whiteUtility =
-    whiteWinLossValue * WIN_LOSS_UTILITY_FACTOR +
-    args.blackNoResultProb * NO_RESULT_UTILITY_FOR_WHITE +
-    staticScoreValue * STATIC_SCORE_UTILITY_FACTOR +
-    dynamicScoreValue * DYNAMIC_SCORE_UTILITY_FACTOR;
-
-  return -whiteUtility;
-}
-
-const VALUE_WEIGHT_EXPONENT: number = 0.25;
-const USE_NOISE_PRUNING = true;
-const NOISE_PRUNE_UTILITY_SCALE = 0.15;
-const NOISE_PRUNING_CAP = 1e50;
-
-type ChildWeightStats = {
-  weightAdjusted: number;
-  selfUtility: number;
-  policy: number;
-  value: number;
-  scoreLead: number;
-  scoreMean: number;
-  scoreMeanSq: number;
-};
-
-type RootSelfStats = {
-  value: number;
-  scoreLead: number;
-  scoreMean: number;
-  scoreMeanSq: number;
-  utility: number;
-  weight: number;
-};
-
-const SQRT_3 = Math.sqrt(3);
-
-function tDistCdf3(z: number): number {
-  const u = z / SQRT_3;
-  const term = u / (1 + u * u);
-  return 0.5 + (Math.atan(u) + term) / Math.PI;
-}
-
-function pruneNoiseWeight(stats: ChildWeightStats[]): number {
-  if (stats.length <= 1) return stats.reduce((acc, s) => acc + s.weightAdjusted, 0);
-  stats.sort((a, b) => b.policy - a.policy);
-
-  let utilitySumSoFar = 0;
-  let weightSumSoFar = 0;
-  let rawPolicySumSoFar = 0;
-
-  for (const s of stats) {
-    const utility = s.selfUtility;
-    const oldWeight = s.weightAdjusted;
-    const rawPolicy = Math.max(1e-30, s.policy);
-    let newWeight = oldWeight;
-
-    if (weightSumSoFar > 0 && rawPolicySumSoFar > 0) {
-      const avgUtilitySoFar = utilitySumSoFar / weightSumSoFar;
-      const utilityGap = avgUtilitySoFar - utility;
-      if (utilityGap > 0) {
-        const weightShareFromRawPolicy = (weightSumSoFar * rawPolicy) / rawPolicySumSoFar;
-        const lenientWeightShareFromRawPolicy = 2.0 * weightShareFromRawPolicy;
-        if (oldWeight > lenientWeightShareFromRawPolicy) {
-          const excessWeight = oldWeight - lenientWeightShareFromRawPolicy;
-          let weightToSubtract = excessWeight * (1.0 - Math.exp(-utilityGap / NOISE_PRUNE_UTILITY_SCALE));
-          if (weightToSubtract > NOISE_PRUNING_CAP) weightToSubtract = NOISE_PRUNING_CAP;
-          newWeight = oldWeight - weightToSubtract;
-          s.weightAdjusted = newWeight;
-        }
-      }
-    }
-
-    utilitySumSoFar += utility * newWeight;
-    weightSumSoFar += newWeight;
-    rawPolicySumSoFar += rawPolicy;
-  }
-
-  return weightSumSoFar;
-}
-
-function downweightBadChildrenAndNormalizeWeight(args: {
-  stats: ChildWeightStats[];
-  currentTotalWeight: number;
-  desiredTotalWeight: number;
-  amountToSubtract: number;
-  amountToPrune: number;
-}): void {
-  const stats = args.stats;
-  const desiredTotalWeight = args.desiredTotalWeight;
-  if (stats.length === 0 || args.currentTotalWeight <= 0) return;
-
-  if (VALUE_WEIGHT_EXPONENT === 0) {
-    let currentTotalWeight = args.currentTotalWeight;
-    for (const s of stats) {
-      if (s.weightAdjusted < args.amountToPrune) {
-        currentTotalWeight -= s.weightAdjusted;
-        s.weightAdjusted = 0;
-        continue;
-      }
-      const newWeight = s.weightAdjusted - args.amountToSubtract;
-      if (newWeight <= 0) {
-        currentTotalWeight -= s.weightAdjusted;
-        s.weightAdjusted = 0;
-      } else {
-        currentTotalWeight -= args.amountToSubtract;
-        s.weightAdjusted = newWeight;
-      }
-    }
-
-    if (currentTotalWeight > 0 && currentTotalWeight !== desiredTotalWeight) {
-      const factor = desiredTotalWeight / currentTotalWeight;
-      for (const s of stats) s.weightAdjusted *= factor;
-    }
-    return;
-  }
-
-  const stdevs: number[] = new Array(stats.length);
-  let simpleValueSum = 0;
-  for (let i = 0; i < stats.length; i++) {
-    const s = stats[i]!;
-    const weight = s.weightAdjusted;
-    if (weight <= 0) continue;
-    const precision = 1.5 * Math.sqrt(weight);
-    stdevs[i] = Math.sqrt(1e-8 + 1.0 / precision);
-    simpleValueSum += s.selfUtility * weight;
-  }
-
-  const simpleValue = simpleValueSum / args.currentTotalWeight;
-  let totalNewUnnormWeight = 0;
-
-  for (let i = 0; i < stats.length; i++) {
-    const s = stats[i]!;
-    if (s.weightAdjusted < args.amountToPrune) {
-      s.weightAdjusted = 0;
-      continue;
-    }
-    const newWeight = s.weightAdjusted - args.amountToSubtract;
-    if (newWeight <= 0) {
-      s.weightAdjusted = 0;
-      continue;
-    }
-    s.weightAdjusted = newWeight;
-
-    const stdev = stdevs[i];
-    if (!stdev || stdev <= 0) continue;
-    const z = (s.selfUtility - simpleValue) / stdev;
-    const p = tDistCdf3(z) + 0.0001;
-    s.weightAdjusted *= Math.pow(p, VALUE_WEIGHT_EXPONENT);
-    totalNewUnnormWeight += s.weightAdjusted;
-  }
-
-  if (totalNewUnnormWeight <= 0) return;
-  const factor = desiredTotalWeight / totalNewUnnormWeight;
-  for (const s of stats) s.weightAdjusted *= factor;
-}
-
-function computeWeightedRootStats(args: { children: ChildWeightStats[]; rootSelf: RootSelfStats }): {
-  rootValue: number;
-  rootWinRate: number;
-  rootScoreLead: number;
-  rootScoreSelfplay: number;
-  rootScoreStdev: number;
-} {
-  const stats = args.children;
-  if (stats.length === 0) {
-    const rootValue = args.rootSelf.value;
-    const rootScoreSelfplay = args.rootSelf.scoreMean;
-    const rootScoreMeanSq = args.rootSelf.scoreMeanSq;
-    const rootScoreStdev = Math.sqrt(Math.max(0, rootScoreMeanSq - rootScoreSelfplay * rootScoreSelfplay));
-    return {
-      rootValue,
-      rootWinRate: (rootValue + 1) * 0.5,
-      rootScoreLead: args.rootSelf.scoreLead,
-      rootScoreSelfplay,
-      rootScoreStdev,
-    };
-  }
-
-  let totalWeight = 0;
-  for (const s of stats) totalWeight += s.weightAdjusted;
-  if (USE_NOISE_PRUNING) totalWeight = pruneNoiseWeight(stats);
-
-  downweightBadChildrenAndNormalizeWeight({
-    stats,
-    currentTotalWeight: totalWeight,
-    desiredTotalWeight: totalWeight,
-    amountToSubtract: 0,
-    amountToPrune: 0,
-  });
-
-  let weightSum = 0;
-  let valueSum = 0;
-  let scoreMeanSum = 0;
-  let scoreMeanSqSum = 0;
-  let scoreLeadSum = 0;
-
-  for (const s of stats) {
-    if (s.weightAdjusted <= 0) continue;
-    weightSum += s.weightAdjusted;
-    valueSum += s.weightAdjusted * s.value;
-    scoreMeanSum += s.weightAdjusted * s.scoreMean;
-    scoreMeanSqSum += s.weightAdjusted * s.scoreMeanSq;
-    scoreLeadSum += s.weightAdjusted * s.scoreLead;
-  }
-
-  weightSum += args.rootSelf.weight;
-  valueSum += args.rootSelf.weight * args.rootSelf.value;
-  scoreMeanSum += args.rootSelf.weight * args.rootSelf.scoreMean;
-  scoreMeanSqSum += args.rootSelf.weight * args.rootSelf.scoreMeanSq;
-  scoreLeadSum += args.rootSelf.weight * args.rootSelf.scoreLead;
-
-  if (weightSum <= 0) {
-    const rootValue = args.rootSelf.value;
-    const rootScoreSelfplay = args.rootSelf.scoreMean;
-    const rootScoreMeanSq = args.rootSelf.scoreMeanSq;
-    const rootScoreStdev = Math.sqrt(Math.max(0, rootScoreMeanSq - rootScoreSelfplay * rootScoreSelfplay));
-    return {
-      rootValue,
-      rootWinRate: (rootValue + 1) * 0.5,
-      rootScoreLead: args.rootSelf.scoreLead,
-      rootScoreSelfplay,
-      rootScoreStdev,
-    };
-  }
-
-  const rootValue = valueSum / weightSum;
-  const rootScoreSelfplay = scoreMeanSum / weightSum;
-  const rootScoreMeanSq = scoreMeanSqSum / weightSum;
-  const rootScoreStdev = Math.sqrt(Math.max(0, rootScoreMeanSq - rootScoreSelfplay * rootScoreSelfplay));
-  return {
-    rootValue,
-    rootWinRate: (rootValue + 1) * 0.5,
-    rootScoreLead: scoreLeadSum / weightSum,
-    rootScoreSelfplay,
-    rootScoreStdev,
-  };
-}
 
 function hasLadderCandidates(libertyMap: Uint8Array): boolean {
   for (let i = 0; i < libertyMap.length; i++) {
@@ -741,285 +297,6 @@ function buildLibertySeeds(args: {
   return count;
 }
 
-function averageTreeOwnership(node: Node): { ownership: Float32Array; ownershipStdev: Float32Array } {
-  const out = new Float32Array(BOARD_AREA);
-  const outSq = new Float32Array(BOARD_AREA);
-
-  const visits = node.visits;
-  const minProp = 0.5 / Math.pow(Math.max(1, visits), 0.75);
-  const pruneProp = minProp * 0.01;
-
-  const accumulate = (map: Float32Array, prop: number) => {
-    for (let i = 0; i < BOARD_AREA; i++) {
-      const v = map[i]!;
-      out[i] += prop * v;
-      outSq[i] += prop * v * v;
-    }
-  };
-
-  const traverse = (n: Node, desiredProp: number): boolean => {
-    if (!n.ownership) return false;
-
-    if (desiredProp < minProp) {
-      accumulate(n.ownership, desiredProp);
-      return true;
-    }
-
-    const edges = n.edges;
-    if (!edges || edges.length === 0) {
-      accumulate(n.ownership, desiredProp);
-      return true;
-    }
-
-    let childrenWeightSum = 0;
-    let relativeChildrenWeightSum = 0;
-    const childWeights: number[] = [];
-    const childNodes: Node[] = [];
-
-    for (const e of edges) {
-      const child = e.child;
-      if (!child || child.visits <= 0) continue;
-      const w = child.visits;
-      childWeights.push(w);
-      childNodes.push(child);
-      childrenWeightSum += w;
-      relativeChildrenWeightSum += w * w;
-    }
-
-    const parentNNWeight = 1.0;
-    const denom = childrenWeightSum + parentNNWeight;
-    const desiredPropFromChildren = denom > 0 ? (desiredProp * childrenWeightSum) / denom : 0;
-    let selfProp = denom > 0 ? (desiredProp * parentNNWeight) / denom : desiredProp;
-
-    if (desiredPropFromChildren <= 0 || relativeChildrenWeightSum <= 0) {
-      selfProp += desiredPropFromChildren;
-    } else {
-      for (let i = 0; i < childNodes.length; i++) {
-        const w = childWeights[i]!;
-        const childProp = (w * w * desiredPropFromChildren) / relativeChildrenWeightSum;
-        if (childProp < pruneProp) {
-          selfProp += childProp;
-          continue;
-        }
-        const ok = traverse(childNodes[i]!, childProp);
-        if (!ok) selfProp += childProp;
-      }
-    }
-
-    accumulate(n.ownership, selfProp);
-    return true;
-  };
-
-  traverse(node, 1.0);
-
-  const stdev = new Float32Array(BOARD_AREA);
-  for (let i = 0; i < BOARD_AREA; i++) {
-    const mean = out[i]!;
-    const variance = outSq[i]! - mean * mean;
-    stdev[i] = Math.sqrt(Math.max(0, variance));
-  }
-
-  return { ownership: out, ownershipStdev: stdev };
-}
-
-const CPUCT_EXPLORATION = 1.0;
-const CPUCT_EXPLORATION_LOG = 0.45;
-const CPUCT_EXPLORATION_BASE = 500;
-const CPUCT_UTILITY_STDEV_PRIOR = 0.4;
-const CPUCT_UTILITY_STDEV_PRIOR_WEIGHT = 2.0;
-const CPUCT_UTILITY_STDEV_SCALE = 0.85;
-const FPU_REDUCTION_MAX = 0.2;
-const ROOT_FPU_REDUCTION_MAX = 0.1;
-const FPU_LOSS_PROP = 0.0;
-const ROOT_FPU_LOSS_PROP = 0.0;
-const FPU_PARENT_WEIGHT_BY_VISITED_POLICY = true;
-const FPU_PARENT_WEIGHT_BY_VISITED_POLICY_POW = 2.0;
-const FPU_PARENT_WEIGHT = 0.0;
-const TOTALCHILDWEIGHT_PUCT_OFFSET = 0.01;
-
-function cpuctExploration(totalChildWeight: number): number {
-  return (
-    CPUCT_EXPLORATION +
-    CPUCT_EXPLORATION_LOG * Math.log((totalChildWeight + CPUCT_EXPLORATION_BASE) / CPUCT_EXPLORATION_BASE)
-  );
-}
-
-function exploreScaling(totalChildWeight: number, parentUtilityStdevFactor: number): number {
-  return (
-    cpuctExploration(totalChildWeight) *
-    Math.sqrt(totalChildWeight + TOTALCHILDWEIGHT_PUCT_OFFSET) *
-    parentUtilityStdevFactor
-  );
-}
-
-class Rand {
-  private spare: number | null = null;
-
-  nextBool(p: number): boolean {
-    return Math.random() < p;
-  }
-
-  nextGaussian(): number {
-    if (this.spare !== null) {
-      const v = this.spare;
-      this.spare = null;
-      return v;
-    }
-
-    let u = 0;
-    let v = 0;
-    let s = 0;
-    while (s === 0 || s >= 1) {
-      u = Math.random() * 2 - 1;
-      v = Math.random() * 2 - 1;
-      s = u * u + v * v;
-    }
-    const mul = Math.sqrt((-2 * Math.log(s)) / s);
-    this.spare = v * mul;
-    return u * mul;
-  }
-}
-
-function selectEdge(node: Node, isRoot: boolean, wideRootNoise: number, rand: Rand): Edge {
-  const edges = node.edges;
-  if (!edges || edges.length === 0) throw new Error('selectEdge called on unexpanded node');
-
-  const pla = node.playerToMove;
-  const sign = pla === BLACK ? 1 : -1;
-
-  let totalChildWeight = 0;
-  let policyProbMassVisited = 0;
-
-  for (const e of edges) {
-    const child = e.child;
-    if (!child) continue;
-    const w = child.visits + child.inFlight;
-    if (w <= 0) continue;
-    totalChildWeight += w;
-    policyProbMassVisited += e.prior;
-  }
-
-  const visits = node.visits;
-  const weightSum = visits;
-  const parentUtility = visits > 0 ? node.utilitySum / visits : 0;
-  const parentUtilitySqAvg = visits > 0 ? node.utilitySqSum / visits : parentUtility * parentUtility;
-
-  const variancePrior = CPUCT_UTILITY_STDEV_PRIOR * CPUCT_UTILITY_STDEV_PRIOR;
-  const variancePriorWeight = CPUCT_UTILITY_STDEV_PRIOR_WEIGHT;
-  let parentUtilityStdev: number;
-  if (visits <= 0 || weightSum <= 1) {
-    parentUtilityStdev = CPUCT_UTILITY_STDEV_PRIOR;
-  } else {
-    const utilitySq = parentUtility * parentUtility;
-    let utilitySqAvg = parentUtilitySqAvg;
-    if (utilitySqAvg < utilitySq) utilitySqAvg = utilitySq;
-    parentUtilityStdev = Math.sqrt(
-      Math.max(
-        0,
-        ((utilitySq + variancePrior) * variancePriorWeight + utilitySqAvg * weightSum) / (variancePriorWeight + weightSum - 1.0) -
-          utilitySq
-      )
-    );
-  }
-
-  const parentUtilityStdevFactor =
-    1.0 + CPUCT_UTILITY_STDEV_SCALE * (parentUtilityStdev / CPUCT_UTILITY_STDEV_PRIOR - 1.0);
-
-  let parentUtilityForFPU = parentUtility;
-  const parentNNUtility = node.nnUtility ?? parentUtility;
-  if (FPU_PARENT_WEIGHT_BY_VISITED_POLICY) {
-    const avgWeight = Math.min(1.0, Math.pow(policyProbMassVisited, FPU_PARENT_WEIGHT_BY_VISITED_POLICY_POW));
-    parentUtilityForFPU = avgWeight * parentUtility + (1.0 - avgWeight) * parentNNUtility;
-  } else if (FPU_PARENT_WEIGHT > 0.0) {
-    parentUtilityForFPU = FPU_PARENT_WEIGHT * parentNNUtility + (1.0 - FPU_PARENT_WEIGHT) * parentUtility;
-  }
-
-  const fpuReductionMax = isRoot ? ROOT_FPU_REDUCTION_MAX : FPU_REDUCTION_MAX;
-  const fpuLossProp = isRoot ? ROOT_FPU_LOSS_PROP : FPU_LOSS_PROP;
-  const reduction = fpuReductionMax * Math.sqrt(Math.max(0, policyProbMassVisited));
-  let fpuValue = pla === BLACK ? parentUtilityForFPU - reduction : parentUtilityForFPU + reduction;
-
-  const utilityRadius = WIN_LOSS_UTILITY_FACTOR + STATIC_SCORE_UTILITY_FACTOR + DYNAMIC_SCORE_UTILITY_FACTOR;
-  const lossValue = pla === BLACK ? -utilityRadius : utilityRadius;
-  fpuValue = fpuValue + (lossValue - fpuValue) * fpuLossProp;
-
-  const scaling = exploreScaling(totalChildWeight, parentUtilityStdevFactor);
-
-  let bestEdge = edges[0]!;
-  let bestScore = Number.NEGATIVE_INFINITY;
-
-  const applyWideRootNoise = isRoot && wideRootNoise > 0;
-  const wideRootNoisePolicyExponent = applyWideRootNoise ? 1.0 / (4.0 * wideRootNoise + 1.0) : 1.0;
-
-  for (const e of edges) {
-    const child = e.child;
-    const childWeight = child ? child.visits + child.inFlight : 0;
-    let childUtility = child && child.visits > 0 ? child.utilitySum / child.visits : fpuValue;
-    let prior = e.prior;
-
-    if (applyWideRootNoise) {
-      // Mirrors KataGo's wideRootNoise: smooth policy and add random utility bonuses (root only).
-      prior = Math.pow(prior, wideRootNoisePolicyExponent);
-      if (rand.nextBool(0.5)) {
-        const bonus = wideRootNoise * Math.abs(rand.nextGaussian());
-        // Utility is stored from black's perspective in this port; adjust so that
-        // the player's-perspective selection value (explore + sign*utility) gets +bonus.
-        childUtility += pla === BLACK ? bonus : -bonus;
-      }
-    }
-
-    const explore = (scaling * prior) / (1.0 + childWeight);
-    const score = explore + sign * childUtility;
-    if (score > bestScore) {
-      bestScore = score;
-      bestEdge = e;
-    }
-  }
-
-  return bestEdge;
-}
-
-export function moveToGtp(move: number): string {
-  if (move === PASS_MOVE) return 'pass';
-  const x = move % BOARD_SIZE;
-  const y = (move / BOARD_SIZE) | 0;
-  const col = x >= 8 ? x + 1 : x; // Skip 'I'
-  const letter = String.fromCharCode(65 + col);
-  return `${letter}${BOARD_SIZE - y}`;
-}
-
-function buildPv(edge: Edge, maxDepth: number): string[] {
-  const pvMoves: number[] = [edge.move];
-  let node = edge.child;
-  let depth = 1;
-
-  while (node && node.edges && node.edges.length > 0 && depth < maxDepth) {
-    let best: Edge | null = null;
-    let bestVisits = 0;
-    for (const e of node.edges) {
-      const v = e.child ? e.child.visits : 0;
-      if (v > bestVisits) {
-        bestVisits = v;
-        best = e;
-      }
-    }
-    if (!best || bestVisits <= 0) break;
-    pvMoves.push(best.move);
-    node = best.child;
-    depth++;
-  }
-
-  return pvMoves.map(moveToGtp);
-}
-
-function getPvForEdge(edge: Edge, maxDepth: number): string[] {
-  const visits = edge.child?.visits ?? 0;
-  const cache = edge.pvCache;
-  if (cache && cache.visits === visits && cache.depth === maxDepth) return cache.pv;
-  const pv = buildPv(edge, maxDepth);
-  edge.pvCache = { visits, depth: maxDepth, pv };
-  return pv;
-}
 
 const NUM_SYMMETRIES = 8;
 let symPosMapBoardArea = 0;
@@ -1186,109 +463,14 @@ async function evaluateRootEval(args: {
   );
 }
 
-type EvalBatchScratch = {
-  spatialBatch: Float32Array;
-  globalBatch: Float32Array;
-  libertyMapScratch: Uint8Array;
-  areaMapScratch: Uint8Array | null;
-  ladderedStonesScratch: Uint8Array;
-  ladderWorkingMovesScratch: Uint8Array;
-  prevLadderedStonesScratch: Uint8Array;
-  prevPrevLadderedStonesScratch: Uint8Array;
-  symmetries: Uint8Array;
-  spatialScratch: Float32Array;
-  globalScratch: Float32Array;
-  policyScratch: Float32Array;
-  passScratch: Float32Array;
-};
-
-let EMPTY_AREA_MAP = new Uint8Array(BOARD_AREA);
 
 // Two ping-pong slots so one can be in-flight to the GPU while the other is
 // being filled by the CPU for the next batch (§ 1.1 double-buffered dispatch).
-let evalScratchNoArea: [EvalBatchScratch | null, EvalBatchScratch | null] = [null, null];
-let evalScratchWithArea: [EvalBatchScratch | null, EvalBatchScratch | null] = [null, null];
-let evalScratchBoardArea = BOARD_AREA;
+const defaultEvalContext = new EvaluationContext();
 
-function getEvalScratch(args: { batch: number; includeAreaFeature: boolean; slot?: number }): EvalBatchScratch {
-  const { batch, includeAreaFeature } = args;
-  const slot = (args.slot ?? 0) & 1;
-  if (evalScratchBoardArea !== BOARD_AREA) {
-    evalScratchNoArea = [null, null];
-    evalScratchWithArea = [null, null];
-    evalScratchBoardArea = BOARD_AREA;
-    EMPTY_AREA_MAP = new Uint8Array(BOARD_AREA);
-  }
-  const neededSpatial = batch * BOARD_AREA * 22;
-  const neededGlobal = batch * 19;
-  const neededMaps = batch * BOARD_AREA;
-  const neededPolicy = batch * BOARD_AREA;
-
-  const existing = includeAreaFeature ? evalScratchWithArea[slot] : evalScratchNoArea[slot];
-  if (
-    existing &&
-    existing.spatialBatch.length >= neededSpatial &&
-    existing.globalBatch.length >= neededGlobal &&
-    existing.libertyMapScratch.length >= neededMaps &&
-    existing.symmetries.length >= batch &&
-    existing.policyScratch.length >= neededPolicy &&
-    existing.passScratch.length >= batch &&
-    (!includeAreaFeature || (existing.areaMapScratch && existing.areaMapScratch.length >= neededMaps))
-  ) {
-    return existing;
-  }
-
-  const scratch: EvalBatchScratch = {
-    spatialBatch: new Float32Array(neededSpatial),
-    globalBatch: new Float32Array(neededGlobal),
-    libertyMapScratch: new Uint8Array(neededMaps),
-    areaMapScratch: includeAreaFeature ? new Uint8Array(neededMaps) : null,
-    ladderedStonesScratch: new Uint8Array(BOARD_AREA),
-    ladderWorkingMovesScratch: new Uint8Array(BOARD_AREA),
-    prevLadderedStonesScratch: new Uint8Array(BOARD_AREA),
-    prevPrevLadderedStonesScratch: new Uint8Array(BOARD_AREA),
-    symmetries: new Uint8Array(batch),
-    spatialScratch: new Float32Array(BOARD_AREA * 22),
-    globalScratch: new Float32Array(19),
-    policyScratch: new Float32Array(neededPolicy),
-    passScratch: new Float32Array(batch),
-  };
-
-  if (includeAreaFeature) evalScratchWithArea[slot] = scratch;
-  else evalScratchNoArea[slot] = scratch;
-  return scratch;
+function getEvalScratch(args: { batch: number; includeAreaFeature: boolean; slot?: number; evalContext?: EvaluationContext }): EvalBatchScratch {
+  return (args.evalContext ?? defaultEvalContext).getScratch(args);
 }
-
-type EvalState = {
-  stones: Uint8Array;
-  koPoint: number;
-  prevStones: Uint8Array;
-  prevKoPoint: number;
-  prevPrevStones: Uint8Array;
-  prevPrevKoPoint: number;
-  currentPlayer: Player;
-  recentMoves: RecentMove[];
-  libertyMap?: Uint8Array;
-  prevLibertyMap?: Uint8Array;
-  prevPrevLibertyMap?: Uint8Array;
-  komi?: number;
-  conservativePassAndIsRoot?: boolean;
-  symmetry?: number;
-};
-
-export type NeuralEval = {
-  policy: Float32Array; // len 361, in symmetry space if symmetry != 0
-  symmetry: number; // 0..7, where 0 is identity
-  passLogit: number;
-  blackWinProb: number;
-  blackScoreLead: number;
-  blackScoreMean: number;
-  blackScoreStdev: number;
-  blackNoResultProb: number;
-  libertyMap: Uint8Array;
-  areaMap: Uint8Array;
-  ownership?: Float32Array; // len 361, raw logits (player-to-move perspective, symmetry space if symmetry != 0)
-};
 
 function prepareBatchFeatures(args: {
   states: EvalState[];
@@ -1296,8 +478,11 @@ function prepareBatchFeatures(args: {
   komi: number;
   nnRandomize: boolean;
   scratch: EvalBatchScratch;
+  randomSource?: RandomSource;
+  featureCache?: FeatureCache;
 }): { batch: number; spatialBatch: Float32Array; globalBatch: Float32Array } {
-  const { states, rules, komi, nnRandomize, scratch } = args;
+  const { states, rules, komi, nnRandomize, scratch, featureCache } = args;
+  const randSource = args.randomSource ?? DefaultRandomSource;
   const includeAreaFeature = rules === 'chinese';
   const batch = states.length;
   const spatialBatch = scratch.spatialBatch.subarray(0, batch * BOARD_AREA * 22);
@@ -1305,24 +490,35 @@ function prepareBatchFeatures(args: {
   const libertyMapScratch = scratch.libertyMapScratch.subarray(0, batch * BOARD_AREA);
   const areaMapScratch = includeAreaFeature ? scratch.areaMapScratch!.subarray(0, batch * BOARD_AREA) : null;
   const symmetries = scratch.symmetries.subarray(0, batch);
-  const spatialScratch = scratch.spatialScratch;
 
   for (let i = 0; i < batch; i++) {
     const state = states[i]!;
     const libertyMap = libertyMapScratch.subarray(i * BOARD_AREA, (i + 1) * BOARD_AREA);
     if (state.libertyMap) libertyMap.set(state.libertyMap);
     else computeLibertyMapInto(state.stones, libertyMap);
-    const areaMap = includeAreaFeature
-      ? computeAreaMapV7KataGoInto(state.stones, areaMapScratch!.subarray(i * BOARD_AREA, (i + 1) * BOARD_AREA))
-      : EMPTY_AREA_MAP;
+
+    let areaMap: Uint8Array<ArrayBufferLike> = EMPTY_AREA_MAP;
+    if (includeAreaFeature) {
+      const dstArea = areaMapScratch!.subarray(i * BOARD_AREA, (i + 1) * BOARD_AREA);
+      if (!featureCache || !featureCache.getAreaMap(state.stones, dstArea)) {
+        computeAreaMapV7KataGoInto(state.stones, dstArea);
+        featureCache?.putAreaMap(state.stones, dstArea);
+      }
+      areaMap = dstArea;
+    }
+
+    const plaColor = playerToColor(state.currentPlayer);
     if (hasLadderCandidates(libertyMap)) {
-      computeLadderFeaturesV7KataGoInto({
-        stones: state.stones,
-        koPoint: state.koPoint,
-        currentPlayer: playerToColor(state.currentPlayer),
-        outLadderedStones: scratch.ladderedStonesScratch,
-        outLadderWorkingMoves: scratch.ladderWorkingMovesScratch,
-      });
+      if (!featureCache || !featureCache.getLadderFeatures(state.stones, state.koPoint, plaColor, scratch.ladderedStonesScratch, scratch.ladderWorkingMovesScratch)) {
+        computeLadderFeaturesV7KataGoInto({
+          stones: state.stones,
+          koPoint: state.koPoint,
+          currentPlayer: plaColor,
+          outLadderedStones: scratch.ladderedStonesScratch,
+          outLadderWorkingMoves: scratch.ladderWorkingMovesScratch,
+        });
+        featureCache?.putLadderFeatures(state.stones, state.koPoint, plaColor, scratch.ladderedStonesScratch, scratch.ladderWorkingMovesScratch);
+      }
     } else {
       scratch.ladderedStonesScratch.fill(0);
       scratch.ladderWorkingMovesScratch.fill(0);
@@ -1335,14 +531,14 @@ function prepareBatchFeatures(args: {
 
     const pla = state.currentPlayer;
     const opp = pla === 'black' ? 'white' : 'black';
-    const expectedPlayers: Player[] = [opp, pla, opp, pla, opp];
 
     let numTurnsOfHistoryIncluded = 0;
     if (!suppressHistory) {
       for (let h = 0; h < 5; h++) {
         const m = recentMoves[recentMoves.length - 1 - h];
         if (!m) break;
-        if (m.player !== expectedPlayers[h]) break;
+        const expectedPlayer = (h & 1) === 0 ? opp : pla;
+        if (m.player !== expectedPlayer) break;
         numTurnsOfHistoryIncluded++;
       }
     }
@@ -1356,22 +552,28 @@ function prepareBatchFeatures(args: {
     if (prevLibertyMap && !hasLadderCandidates(prevLibertyMap)) {
       scratch.prevLadderedStonesScratch.fill(0);
     } else {
-      computeLadderedStonesV7KataGoInto({
-        stones: prevLadderStones,
-        koPoint: prevLadderKoPoint,
-        outLadderedStones: scratch.prevLadderedStonesScratch,
-      });
+      if (!featureCache || !featureCache.getLadderFeatures(prevLadderStones, prevLadderKoPoint, plaColor, scratch.prevLadderedStonesScratch)) {
+        computeLadderedStonesV7KataGoInto({
+          stones: prevLadderStones,
+          koPoint: prevLadderKoPoint,
+          outLadderedStones: scratch.prevLadderedStonesScratch,
+        });
+        featureCache?.putLadderFeatures(prevLadderStones, prevLadderKoPoint, plaColor, scratch.prevLadderedStonesScratch);
+      }
     }
     const prevPrevLibertyMap =
       prevPrevLadderStones === prevLadderStones ? prevLibertyMap : state.prevPrevLibertyMap;
     if (prevPrevLibertyMap && !hasLadderCandidates(prevPrevLibertyMap)) {
       scratch.prevPrevLadderedStonesScratch.fill(0);
     } else {
-      computeLadderedStonesV7KataGoInto({
-        stones: prevPrevLadderStones,
-        koPoint: prevPrevLadderKoPoint,
-        outLadderedStones: scratch.prevPrevLadderedStonesScratch,
-      });
+      if (!featureCache || !featureCache.getLadderFeatures(prevPrevLadderStones, prevPrevLadderKoPoint, plaColor, scratch.prevPrevLadderedStonesScratch)) {
+        computeLadderedStonesV7KataGoInto({
+          stones: prevPrevLadderStones,
+          koPoint: prevPrevLadderKoPoint,
+          outLadderedStones: scratch.prevPrevLadderedStonesScratch,
+        });
+        featureCache?.putLadderFeatures(prevPrevLadderStones, prevPrevLadderKoPoint, plaColor, scratch.prevPrevLadderedStonesScratch);
+      }
     }
 
     const requestedSymmetry = state.symmetry;
@@ -1379,12 +581,13 @@ function prepareBatchFeatures(args: {
       typeof requestedSymmetry === 'number' && Number.isFinite(requestedSymmetry)
         ? Math.max(0, Math.min(NUM_SYMMETRIES - 1, Math.floor(requestedSymmetry)))
         : nnRandomize
-          ? ((Math.random() * NUM_SYMMETRIES) | 0)
+          ? ((randSource.next() * NUM_SYMMETRIES) | 0)
           : 0;
     symmetries[i] = sym;
     const spatialOffset = i * BOARD_AREA * 22;
-    const outSpatial = sym === 0 ? spatialBatch.subarray(spatialOffset, spatialOffset + BOARD_AREA * 22) : spatialScratch;
+    const outSpatial = spatialBatch.subarray(spatialOffset, spatialOffset + BOARD_AREA * 22);
     const outGlobal = globalBatch.subarray(i * 19, (i + 1) * 19);
+    const symMap = sym === 0 ? null : getSymPosMap().subarray(sym * BOARD_AREA, (sym + 1) * BOARD_AREA);
 
     fillInputsV7Fast({
       stones: state.stones,
@@ -1400,146 +603,26 @@ function prepareBatchFeatures(args: {
       ladderWorkingMoves: scratch.ladderWorkingMovesScratch,
       prevLadderedStones: scratch.prevLadderedStonesScratch,
       prevPrevLadderedStones: scratch.prevPrevLadderedStonesScratch,
+      symmetryMap: symMap,
       outSpatial,
       outGlobal,
     });
-
-    if (sym !== 0) {
-      const symOff = sym * BOARD_AREA;
-      const symPosMap = getSymPosMap();
-      const src = spatialScratch;
-      for (let pos = 0; pos < BOARD_AREA; pos++) {
-        const dstPos = symPosMap[symOff + pos]!;
-        const srcBase = pos * 22;
-        const dstBase = spatialOffset + dstPos * 22;
-        for (let c = 0; c < 22; c++) {
-          spatialBatch[dstBase + c] = src[srcBase + c]!;
-        }
-      }
-    }
   }
 
   return { batch, spatialBatch, globalBatch };
 }
 
-async function createInputTensors(
+function createInputTensorsSync(
   model: KataGoModelV8Tf,
   spatialBatch: Float32Array,
   globalBatch: Float32Array,
   batch: number
-): Promise<{ spatial: tf.Tensor4D; global: tf.Tensor2D; disposeInputs: boolean }> {
-  if (getVisitSpeedFlags().tensorReuse && model.inputBuffers.supportsWrites) {
-    try {
-      const uploaded = await model.inputBuffers.uploadBatch(spatialBatch, globalBatch, batch);
-      return {
-        spatial: uploaded.spatial,
-        global: uploaded.global,
-        disposeInputs: uploaded.disposeSlice,
-      };
-    } catch {
-      // Tensor.write may be unavailable on some TF.js backends — fall back to alloc path.
-    }
-  }
+): { spatial: tf.Tensor4D; global: tf.Tensor2D; disposeInputs: boolean } {
   return {
     spatial: tf.tensor4d(spatialBatch, [batch, BOARD_SIZE, BOARD_SIZE, 22]),
     global: tf.tensor2d(globalBatch, [batch, 19]),
     disposeInputs: true,
   };
-}
-
-function processNeuralOutputs(args: {
-  model: KataGoModelV8Tf;
-  states: EvalState[];
-  batch: number;
-  includeOwnership: boolean;
-  policyOptimism: number;
-  symmetries: Uint8Array;
-  libertyMapScratch: Uint8Array;
-  areaMapScratch: Uint8Array | null;
-  includeAreaFeature: boolean;
-  scratch: EvalBatchScratch;
-  policyArr: Float32Array | Int32Array | Uint8Array;
-  passArr: Float32Array | Int32Array | Uint8Array;
-  valueArr: Float32Array | Int32Array | Uint8Array;
-  scoreArr: Float32Array | Int32Array | Uint8Array;
-  ownershipArr: Float32Array | Int32Array | Uint8Array | null;
-}): NeuralEval[] {
-  const {
-    model,
-    states,
-    batch,
-    includeOwnership,
-    policyOptimism,
-    symmetries,
-    libertyMapScratch,
-    areaMapScratch,
-    includeAreaFeature,
-    scratch,
-    policyArr,
-    passArr,
-    valueArr,
-    scoreArr,
-    ownershipArr,
-  } = args;
-
-  const policyChannels = model.policyOutChannels;
-  const usePolicyOptimism = policyChannels === 2 || (policyChannels === 4 && model.modelVersion >= 16);
-  const mix = usePolicyOptimism ? policyOptimism : 0;
-  let policyLogits = policyArr as Float32Array;
-  let passLogits = passArr as Float32Array;
-
-  if (policyChannels > 1) {
-    const mixedPolicy = scratch.policyScratch.subarray(0, batch * BOARD_AREA);
-    const mixedPass = scratch.passScratch.subarray(0, batch);
-    for (let i = 0; i < batch; i++) {
-      const baseOff = i * BOARD_AREA * policyChannels;
-      const outOff = i * BOARD_AREA;
-      for (let p = 0; p < BOARD_AREA; p++) {
-        const src = baseOff + p * policyChannels;
-        const base = policyArr[src]!;
-        const opt = policyArr[src + 1]!;
-        mixedPolicy[outOff + p] = base + (opt - base) * mix;
-      }
-      const passBase = passArr[i * policyChannels]!;
-      const passOpt = passArr[i * policyChannels + 1]!;
-      mixedPass[i] = passBase + (passOpt - passBase) * mix;
-    }
-    policyLogits = mixedPolicy;
-    passLogits = mixedPass;
-  }
-
-  const results: NeuralEval[] = [];
-  for (let i = 0; i < batch; i++) {
-    const pOff = i * BOARD_AREA;
-    const sym = symmetries[i]!;
-    const policy = policyLogits.subarray(pOff, pOff + BOARD_AREA);
-    const ownership = includeOwnership ? (ownershipArr as Float32Array).subarray(pOff, pOff + BOARD_AREA) : undefined;
-    const passLogit = passLogits[i]!;
-    const vOff = i * 3;
-    const sOff = i * 4;
-    const evaled = postprocessKataGoV8({
-      nextPlayer: states[i]!.currentPlayer,
-      valueLogits: valueArr.subarray(vOff, vOff + 3),
-      scoreValue: scoreArr.subarray(sOff, sOff + 4),
-      postProcessParams: model.postProcessParams,
-    });
-
-    results.push({
-      policy,
-      symmetry: sym,
-      passLogit,
-      blackWinProb: evaled.blackWinProb,
-      blackScoreLead: evaled.blackScoreLead,
-      blackScoreMean: evaled.blackScoreMean,
-      blackScoreStdev: evaled.blackScoreStdev,
-      blackNoResultProb: evaled.blackNoResultProb,
-      libertyMap: libertyMapScratch.subarray(i * BOARD_AREA, (i + 1) * BOARD_AREA),
-      areaMap: includeAreaFeature ? areaMapScratch!.subarray(i * BOARD_AREA, (i + 1) * BOARD_AREA) : EMPTY_AREA_MAP,
-      ownership,
-    });
-  }
-
-  return results;
 }
 
 async function evaluateBatch(args: {
@@ -1550,27 +633,30 @@ async function evaluateBatch(args: {
   policyOptimism: number;
   komi: number;
   states: EvalState[];
+  randomSource?: RandomSource;
+  evalContext?: EvaluationContext;
 }): Promise<NeuralEval[]> {
-  const { model, states } = args;
+  const { model, states, randomSource, evalContext } = args;
   const includeOwnership = args.includeOwnership === true;
   const rules = args.rules;
   const nnRandomize = args.nnRandomize;
   const policyOptimism = Math.max(0, Math.min(args.policyOptimism, 1));
   const includeAreaFeature = rules === 'chinese';
   const batch = states.length;
-  const scratch = getEvalScratch({ batch, includeAreaFeature });
+  const scratch = getEvalScratch({ batch, includeAreaFeature, evalContext });
   const { spatialBatch, globalBatch } = prepareBatchFeatures({
     states,
     rules,
     komi: args.komi,
     nnRandomize,
     scratch,
+    randomSource,
   });
   const libertyMapScratch = scratch.libertyMapScratch.subarray(0, batch * BOARD_AREA);
   const areaMapScratch = includeAreaFeature ? scratch.areaMapScratch!.subarray(0, batch * BOARD_AREA) : null;
   const symmetries = scratch.symmetries.subarray(0, batch);
 
-  const { spatial: spatialTensor, global: globalTensor, disposeInputs } = await createInputTensors(
+  const { spatial: spatialTensor, global: globalTensor, disposeInputs } = createInputTensorsSync(
     model,
     spatialBatch,
     globalBatch,
@@ -1636,8 +722,11 @@ function dispatchEvalBatchAsync(args: {
   komi: number;
   states: EvalState[];
   slot?: number;
+  randomSource?: RandomSource;
+  evalContext?: EvaluationContext;
+  featureCache?: FeatureCache;
 }): Promise<NeuralEval[]> {
-  const { model, states } = args;
+  const { model, states, randomSource, evalContext, featureCache } = args;
   const slot = args.slot ?? 0;
   const includeOwnership = args.includeOwnership === true;
   const rules = args.rules;
@@ -1645,40 +734,57 @@ function dispatchEvalBatchAsync(args: {
   const policyOptimism = Math.max(0, Math.min(args.policyOptimism, 1));
   const includeAreaFeature = rules === 'chinese';
   const batch = states.length;
-  const scratch = getEvalScratch({ batch, includeAreaFeature, slot });
+  const scratch = getEvalScratch({ batch, includeAreaFeature, slot, evalContext });
   const { spatialBatch, globalBatch } = prepareBatchFeatures({
     states,
     rules,
     komi: args.komi,
     nnRandomize,
     scratch,
+    randomSource,
+    featureCache,
   });
   const libertyMapScratch = scratch.libertyMapScratch.subarray(0, batch * BOARD_AREA);
   const areaMapScratch = includeAreaFeature ? scratch.areaMapScratch!.subarray(0, batch * BOARD_AREA) : null;
   const symmetries = scratch.symmetries.subarray(0, batch);
 
-  return (async () => {
-    const { spatial: spatialTensor, global: globalTensor, disposeInputs } = await createInputTensors(
-      model,
-      spatialBatch,
-      globalBatch,
-      batch
-    );
-    let out: ReturnType<KataGoModelV8Tf['forwardPolicyValue']> | ReturnType<KataGoModelV8Tf['forward']> | undefined;
-    const readOutputs = async () => {
-      try {
-        out = includeOwnership ? model.forward(spatialTensor, globalTensor) : model.forwardPolicyValue(spatialTensor, globalTensor);
-        return await Promise.all([
-          out.policy.data(), out.policyPass.data(), out.value.data(), out.scoreValue.data(),
-          includeOwnership && hasOwnership(out) ? out.ownership.data() : Promise.resolve(null),
-        ]);
-      } finally {
-        if (out) tf.dispose(out);
-      }
-    };
-    let values: Awaited<ReturnType<typeof readOutputs>>;
-    try { values = await readOutputs(); }
-    finally {
+  const { spatial: spatialTensor, global: globalTensor, disposeInputs } = createInputTensorsSync(
+    model,
+    spatialBatch,
+    globalBatch,
+    batch
+  );
+  let out: ReturnType<KataGoModelV8Tf['forwardPolicyValue']> | ReturnType<KataGoModelV8Tf['forward']> | undefined;
+  try {
+    out = includeOwnership
+      ? model.forward(spatialTensor, globalTensor)
+      : model.forwardPolicyValue(spatialTensor, globalTensor);
+  } catch (err) {
+    if (disposeInputs) {
+      spatialTensor.dispose();
+      globalTensor.dispose();
+    }
+    throw err;
+  }
+
+  const readOutputs = async (): Promise<NeuralEval[]> => {
+    let values: [
+      Float32Array | Int32Array | Uint8Array,
+      Float32Array | Int32Array | Uint8Array,
+      Float32Array | Int32Array | Uint8Array,
+      Float32Array | Int32Array | Uint8Array,
+      Float32Array | Int32Array | Uint8Array | null,
+    ];
+    try {
+      values = await Promise.all([
+        out!.policy.data(),
+        out!.policyPass.data(),
+        out!.value.data(),
+        out!.scoreValue.data(),
+        includeOwnership && hasOwnership(out!) ? out!.ownership.data() : Promise.resolve(null),
+      ]);
+    } finally {
+      if (out) tf.dispose(out);
       if (disposeInputs) {
         spatialTensor.dispose();
         globalTensor.dispose();
@@ -1686,64 +792,26 @@ function dispatchEvalBatchAsync(args: {
     }
     const [policyArr, passArr, valueArr, scoreArr, ownershipArr] = values;
 
-    const policyChannels = model.policyOutChannels;
-    const usePolicyOptimism = policyChannels === 2 || (policyChannels === 4 && model.modelVersion >= 16);
-    const mix = usePolicyOptimism ? policyOptimism : 0;
-    let policyLogits = policyArr as Float32Array;
-    let passLogits = passArr as Float32Array;
+    return processNeuralOutputs({
+      model,
+      states,
+      batch,
+      includeOwnership,
+      policyOptimism,
+      symmetries,
+      libertyMapScratch,
+      areaMapScratch,
+      includeAreaFeature,
+      scratch,
+      policyArr,
+      passArr,
+      valueArr,
+      scoreArr,
+      ownershipArr,
+    });
+  };
 
-    if (policyChannels > 1) {
-      const mixedPolicy = scratch.policyScratch.subarray(0, batch * BOARD_AREA);
-      const mixedPass = scratch.passScratch.subarray(0, batch);
-      for (let i = 0; i < batch; i++) {
-        const baseOff = i * BOARD_AREA * policyChannels;
-        const outOff = i * BOARD_AREA;
-        for (let p = 0; p < BOARD_AREA; p++) {
-          const src = baseOff + p * policyChannels;
-          const base = policyArr[src]!;
-          const opt = policyArr[src + 1]!;
-          mixedPolicy[outOff + p] = base + (opt - base) * mix;
-        }
-        const passBase = passArr[i * policyChannels]!;
-        const passOpt = passArr[i * policyChannels + 1]!;
-        mixedPass[i] = passBase + (passOpt - passBase) * mix;
-      }
-      policyLogits = mixedPolicy;
-      passLogits = mixedPass;
-    }
-
-    const results: NeuralEval[] = [];
-    for (let i = 0; i < batch; i++) {
-      const pOff = i * BOARD_AREA;
-      const sym = symmetries[i]!;
-      const policy = policyLogits.subarray(pOff, pOff + BOARD_AREA);
-      const ownership = includeOwnership ? (ownershipArr as Float32Array).subarray(pOff, pOff + BOARD_AREA) : undefined;
-      const passLogit = passLogits[i]!;
-      const vOff = i * 3;
-      const sOff = i * 4;
-      const evaled = postprocessKataGoV8({
-        nextPlayer: states[i]!.currentPlayer,
-        valueLogits: valueArr.subarray(vOff, vOff + 3),
-        scoreValue: scoreArr.subarray(sOff, sOff + 4),
-        postProcessParams: model.postProcessParams,
-      });
-
-      results.push({
-        policy,
-        symmetry: sym,
-        passLogit,
-        blackWinProb: evaled.blackWinProb,
-        blackScoreLead: evaled.blackScoreLead,
-        blackScoreMean: evaled.blackScoreMean,
-        blackScoreStdev: evaled.blackScoreStdev,
-        blackNoResultProb: evaled.blackNoResultProb,
-        libertyMap: libertyMapScratch.subarray(i * BOARD_AREA, (i + 1) * BOARD_AREA),
-        areaMap: includeAreaFeature ? areaMapScratch!.subarray(i * BOARD_AREA, (i + 1) * BOARD_AREA) : EMPTY_AREA_MAP,
-        ownership,
-      });
-    }
-    return results;
-  })();
+  return readOutputs();
 }
 
 export class MctsSearch {
@@ -1775,6 +843,11 @@ export class MctsSearch {
   /** Current visit count at the root — cheap O(1) read for logging. */
   private recentScoreCenter: number;
   private readonly rand: Rand;
+  private readonly randomSource: RandomSource;
+  private readonly clockSource: ClockSource;
+  private readonly evalContext = new EvaluationContext();
+  private readonly featureCache = new FeatureCache();
+  private isRunning = false;
   private rootSelfValue: number;
   private rootSelfScoreLead: number;
   private rootSelfScoreMean: number;
@@ -1788,6 +861,7 @@ export class MctsSearch {
   private jobPrevLibertyMapScratch = new Uint8Array(0);
   private jobPrevPrevLibertyMapScratch = new Uint8Array(0);
   private jobRecentMovesScratch: RecentMove[][] = [];
+  private jobPathStorage: Node[][] = [];
   private libertyMapStack: Uint8Array[] = [];
   private libertySeedsScratch = new Int16Array(BOARD_AREA * 5);
   private treeOwnershipCache: { visits: number; ownership: Float32Array; ownershipStdev: Float32Array; timestamp: number } | null = null;
@@ -1822,6 +896,8 @@ export class MctsSearch {
     rootOwnership: Float32Array;
     recentScoreCenter: number;
     rand: Rand;
+    randomSource?: RandomSource;
+    clockSource?: ClockSource;
     outputScaleMultiplier: number;
     rootSelfValue: number;
     rootSelfScoreLead: number;
@@ -1854,6 +930,8 @@ export class MctsSearch {
     this.rootOwnership = args.rootOwnership;
     this.recentScoreCenter = args.recentScoreCenter;
     this.rand = args.rand;
+    this.randomSource = args.randomSource ?? DefaultRandomSource;
+    this.clockSource = args.clockSource ?? DefaultClockSource;
     this.outputScaleMultiplier = args.outputScaleMultiplier;
     this.rootSelfValue = args.rootSelfValue;
     this.rootSelfScoreLead = args.rootSelfScoreLead;
@@ -1885,6 +963,8 @@ export class MctsSearch {
     wideRootNoise: number;
     rootSymmetrySamples?: number;
     regionOfInterest?: RegionOfInterest | null;
+    randomSource?: RandomSource;
+    clockSource?: ClockSource;
   }): Promise<MctsSearch> {
     const outputScaleMultiplier = args.model.postProcessParams?.outputScaleMultiplier ?? 1.0;
     const rootSymmetrySamples = clampRootSymmetrySamples(args.rootSymmetrySamples);
@@ -1972,7 +1052,9 @@ export class MctsSearch {
       rootPolicy,
       rootOwnership,
       recentScoreCenter,
-      rand: new Rand(),
+      rand: new Rand(args.randomSource ?? DefaultRandomSource),
+      randomSource: args.randomSource,
+      clockSource: args.clockSource,
       outputScaleMultiplier,
       rootSelfValue: rootValue,
       rootSelfScoreLead: rootScoreLead,
@@ -1995,8 +1077,13 @@ export class MctsSearch {
     const batchSize = Math.max(1, Math.min(args.batchSize, 64));
     const shouldAbort = args.shouldAbort;
 
-    if (shouldAbort?.()) return true;
-    if (this.rootNode.visits >= maxVisits) return shouldAbort?.() ?? false;
+    if (this.isRunning) {
+      throw new Error('Concurrent run() calls on the same SearchSession are not permitted.');
+    }
+    this.isRunning = true;
+    try {
+      if (shouldAbort?.()) return true;
+      if (this.rootNode.visits >= maxVisits) return shouldAbort?.() ?? false;
 
     // § 1.1 Double-buffered: 2× capacity so both ping-pong slots can coexist.
     // slotBase 0 uses indices [0, batchSize), slotBase 1 uses [batchSize, 2*batchSize).
@@ -2020,12 +1107,13 @@ export class MctsSearch {
     libertyMapStack[0] = this.rootLibertyMap;
     const libertySeedsScratch = this.libertySeedsScratch;
 
-    const deadline = getAnimationNow() + maxTimeMs;
+    const clock = this.clockSource;
+    const deadline = clock() + maxTimeMs;
     let timeCheckCounter = 0;
     const timeCheckMask = 0x1f;
     const timeExceeded = (): boolean => {
       if ((timeCheckCounter++ & timeCheckMask) !== 0) return false;
-      return getAnimationNow() >= deadline;
+      return clock() >= deadline;
     };
     let lastProgressAt = 0;
     let lastProgressVisits = -1;
@@ -2033,7 +1121,7 @@ export class MctsSearch {
       if (!args.onProgress || !args.reportEveryMs) return;
       const visits = this.rootNode.visits;
       if (visits <= lastProgressVisits) return;
-      const now = getAnimationNow();
+      const now = clock();
       if (now - lastProgressAt < args.reportEveryMs) return;
       lastProgressAt = now;
       lastProgressVisits = visits;
@@ -2069,14 +1157,12 @@ export class MctsSearch {
         attempts++;
         if (attempts > batchSize * batchAttemptMultiplier) break;
 
-        undoMoves.length = 0;
-        undoPlayers.length = 0;
-        undoSnapshots.length = 0;
-        pathMoves.length = 0;
+        captureStack.length = 0;
         sim.stones.set(this.rootStones);
         sim.koPoint = this.rootKoPoint;
         libertyMapStack[0] = this.rootLibertyMap;
         let depth = 0;
+        let pathMovesCount = 0;
 
         const path = this.searchPathNodesScratch;
         path.length = 1;
@@ -2088,10 +1174,9 @@ export class MctsSearch {
           const e = selectEdge(node, node === this.rootNode, this.wideRootNoise, this.rand);
           const move = e.move;
 
-          const snapshot = playMove(sim, move, player, captureStack);
-          undoMoves.push(move);
-          undoPlayers.push(player);
-          undoSnapshots.push(snapshot);
+          playMoveInto(sim, move, player, captureStack, undoSnapshots, depth);
+          undoMoves[depth] = move;
+          undoPlayers[depth] = player;
           const prevLibertyMap = libertyMapStack[depth] ?? this.rootLibertyMap;
           let nextLibertyMap = libertyMapStack[depth + 1];
           if (!nextLibertyMap) nextLibertyMap = new Uint8Array(BOARD_AREA);
@@ -2099,7 +1184,7 @@ export class MctsSearch {
           const seedCount = buildLibertySeeds({
             move,
             captureStack,
-            captureStart: snapshot.captureStart,
+            captureStart: undoSnapshots[depth]!.captureStart,
             out: libertySeedsScratch,
           });
           if (seedCount > 0) {
@@ -2107,17 +1192,16 @@ export class MctsSearch {
           }
           libertyMapStack[depth + 1] = nextLibertyMap;
           depth++;
-          const pathIdx = pathMoves.length;
           const pathPlayer = colorToPlayer(player);
-          let pathEntry = pathMoves[pathIdx];
+          let pathEntry = pathMoves[pathMovesCount];
           if (!pathEntry) {
             pathEntry = { move, player: pathPlayer };
-            pathMoves[pathIdx] = pathEntry;
+            pathMoves[pathMovesCount] = pathEntry;
           } else {
             pathEntry.move = move;
             pathEntry.player = pathPlayer;
           }
-          pathMoves.length = pathIdx + 1;
+          pathMovesCount++;
 
           if (!e.child) e.child = new Node(opponentOf(player));
           node = e.child;
@@ -2128,9 +1212,6 @@ export class MctsSearch {
         }
 
         if (node.pendingEval) {
-          for (let i = undoMoves.length - 1; i >= 0; i--) {
-            undoMove(sim, undoMoves[i]!, undoPlayers[i]!, undoSnapshots[i]!, captureStack);
-          }
           continue;
         }
 
@@ -2180,8 +1261,8 @@ export class MctsSearch {
           }
         }
 
-        if (undoMoves.length >= 1) {
-          const lastIdx = undoMoves.length - 1;
+        if (depth >= 1) {
+          const lastIdx = depth - 1;
           undoMove(sim, undoMoves[lastIdx]!, undoPlayers[lastIdx]!, undoSnapshots[lastIdx]!, captureStack);
 
           if (lastIdx === 0) {
@@ -2196,7 +1277,7 @@ export class MctsSearch {
             prevStones = prevBuf;
             prevKoPoint = sim.koPoint;
 
-            const secondIdx = undoMoves.length - 2;
+            const secondIdx = depth - 2;
             undoMove(sim, undoMoves[secondIdx]!, undoPlayers[secondIdx]!, undoSnapshots[secondIdx]!, captureStack);
 
             if (secondIdx === 0) {
@@ -2209,18 +1290,18 @@ export class MctsSearch {
               prevPrevStones = prevPrevBuf;
               prevPrevKoPoint = sim.koPoint;
             }
-
-            for (let i = secondIdx - 1; i >= 0; i--) {
-              undoMove(sim, undoMoves[i]!, undoPlayers[i]!, undoSnapshots[i]!, captureStack);
-            }
           }
         }
 
         const recentMovesScratch = this.jobRecentMovesScratch[absIdx] ?? (this.jobRecentMovesScratch[absIdx] = []);
+        const jobPath = this.jobPathStorage[absIdx] ?? (this.jobPathStorage[absIdx] = []);
+        jobPath.length = path.length;
+        for (let p = 0; p < path.length; p++) jobPath[p] = path[p]!;
+
         jobList.push({
-          komi: getNNKomi(this.nnKomi, this.rules, pathMoves),
+          komi: getNNKomi(this.nnKomi, this.rules, pathMoves, undefined, pathMovesCount),
           leaf: node,
-          path: path.slice(),
+          path: jobPath,
           stones: leafStones,
           koPoint: leafKoPoint,
           libertyMap: leafLibertyBuf,
@@ -2231,7 +1312,7 @@ export class MctsSearch {
           prevPrevKoPoint,
           prevPrevLibertyMap,
           currentPlayer: leafPlayer,
-          recentMoves: takeRecentMoves(this.rootMoves, pathMoves, 5, recentMovesScratch),
+          recentMoves: takeRecentMoves(this.rootMoves, pathMoves, 5, recentMovesScratch, pathMovesCount),
         });
       }
       return jobList;
@@ -2322,6 +1403,9 @@ export class MctsSearch {
       komi: this.komi,
       states: currentJobs,
       slot: currentSlot,
+      randomSource: this.randomSource,
+      evalContext: this.evalContext,
+      featureCache: this.featureCache,
     });
 
     while (true) {
@@ -2348,6 +1432,9 @@ export class MctsSearch {
           komi: this.komi,
           states: nextJobs,
           slot: nextSlot,
+          randomSource: this.randomSource,
+          evalContext: this.evalContext,
+          featureCache: this.featureCache,
         });
         // Attach a handler immediately while awaiting the older batch below.
         void nextGpuPromise.catch(() => {});
@@ -2402,6 +1489,9 @@ export class MctsSearch {
           komi: this.komi,
           states: currentJobs,
           slot: currentSlot,
+          randomSource: this.randomSource,
+          evalContext: this.evalContext,
+          featureCache: this.featureCache,
         });
         continue;
       }
@@ -2412,6 +1502,9 @@ export class MctsSearch {
     }
 
     return shouldAbort?.() ?? false;
+    } finally {
+      this.isRunning = false;
+    }
   }
 
   getAnalysisLight(args: {
@@ -2634,7 +1727,7 @@ export class MctsSearch {
       const visits = this.rootNode.visits;
       let cached = this.treeOwnershipCache;
       const refreshIntervalMs = args.ownershipRefreshIntervalMs ?? 0;
-      const now = getAnimationNow();
+      const now = this.clockSource();
       if (!cached) {
         cached = { visits, timestamp: now, ...averageTreeOwnership(this.rootNode) };
         this.treeOwnershipCache = cached;
@@ -2685,6 +1778,8 @@ export async function analyzeMcts(args: {
   maxChildren?: number;
   rootSymmetrySamples?: number;
   regionOfInterest?: RegionOfInterest | null;
+  randomSource?: RandomSource;
+  clockSource?: ClockSource;
 }): Promise<{
   rootWinRate: number;
   rootScoreLead: number;
@@ -2722,7 +1817,9 @@ export async function analyzeMcts(args: {
   const nnRandomize = args.nnRandomize !== false;
   const rootSymmetrySamples = clampRootSymmetrySamples(args.rootSymmetrySamples ?? (tf.getBackend() === 'webgpu' && nnRandomize ? NUM_SYMMETRIES : 1));
   const pvDepth = 1 + analysisPvLen;
-  const rand = new Rand();
+  const randomSource = args.randomSource ?? DefaultRandomSource;
+  const clockSource = args.clockSource ?? DefaultClockSource;
+  const rand = new Rand(randomSource);
 
   const rootStones = boardStateToStones(args.board);
   const { rootKoPoint, rootPrevKoPoint, rootPrevPrevKoPoint } = resolveKoState({
@@ -2819,12 +1916,12 @@ export async function analyzeMcts(args: {
   const undoSnapshots: UndoSnapshot[] = [];
   const pathMoves: RecentMove[] = [];
 
-  const deadline = getAnimationNow() + maxTimeMs;
+  const deadline = clockSource() + maxTimeMs;
   let timeCheckCounter = 0;
   const timeCheckMask = 0x1f;
   const timeExceeded = (): boolean => {
     if ((timeCheckCounter++ & timeCheckMask) !== 0) return false;
-    return getAnimationNow() >= deadline;
+    return clockSource() >= deadline;
   };
 
   while (rootNode.visits < maxVisits && !timeExceeded()) {
@@ -2959,6 +2056,7 @@ export async function analyzeMcts(args: {
       policyOptimism: POLICY_OPTIMISM,
       komi: args.komi,
       states: jobs,
+      randomSource,
     });
     timeCheckCounter = 0;
 

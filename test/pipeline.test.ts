@@ -72,4 +72,13 @@ describe('pipelined search lifetime and counting', () => {
     await search.run({ visits: 18, maxTimeMs: 1000, batchSize: 4 });
     expect(search.getAnalysisLight({ topK: 1, analysisPvLen: 1 }).rootVisits).toBe(18);
   });
+
+  it('rejects concurrent run calls on the same search session', async () => {
+    const model = fakeModel(50), search = await create(model.model);
+    const p1 = search.run({ visits: 64, maxTimeMs: 1000, batchSize: 4 });
+    await expect(search.run({ visits: 64, maxTimeMs: 1000, batchSize: 4 })).rejects.toThrow(
+      /Concurrent run\(\) calls/
+    );
+    await p1;
+  });
 });

@@ -22,17 +22,29 @@ if (!modelPath) {
   process.exit(1);
 }
 
-const wasmDir = resolve(process.cwd(), 'node_modules/@tensorflow/tfjs-backend-wasm/dist');
-setWasmPaths(`${wasmDir}/`);
-await tf.setBackend('wasm');
+const targetBackend = process.env.KATAGO_BACKEND || 'wasm';
+if (targetBackend === 'wasm') {
+  const wasmDir = resolve(process.cwd(), 'node_modules/@tensorflow/tfjs-backend-wasm/dist');
+  setWasmPaths(`${wasmDir}/`);
+  await tf.setBackend('wasm');
+} else if (targetBackend === 'webgpu') {
+  await import('@tensorflow/tfjs-backend-webgpu');
+  await tf.setBackend('webgpu');
+} else {
+  await tf.setBackend(targetBackend);
+}
 await tf.ready();
+
+if (tf.getBackend() !== targetBackend) {
+  throw new Error(`Failed to initialize target backend: requested ${targetBackend}, got ${tf.getBackend()}`);
+}
 
 const raw = readFileSync(modelPath);
 const parsed = parseKataGoModelV8(gunzipSync(raw));
 const model = new KataGoModelV8Tf(parsed, {
   fuseRotary: true,
   fuseRmsNorm: true,
-  fuseTransformerProjections: true,
+  fuseTransformerProjections: false, // Production default
 });
 
 // 1. Forward Pass Latency Benchmark (Batch = 1)
@@ -88,18 +100,22 @@ const search = await MctsSearch.create({
   rootSymmetrySamples: 1,
 });
 
+const initialVisits = search.getAnalysisLight({ topK: 1, analysisPvLen: 1 }).rootVisits;
 const tSearch0 = performance.now();
 await search.run({ visits: 10, maxTimeMs: 60000, batchSize: 2 });
 const searchElapsed = performance.now() - tSearch0;
 const analysis = search.getAnalysisLight({ topK: 1, analysisPvLen: 1 });
-const visitsPerSec = analysis.rootVisits / (searchElapsed / 1000);
+const completedVisits = analysis.rootVisits - initialVisits;
+const visitsPerSec = completedVisits / (searchElapsed / 1000);
 
 model.dispose();
 
 console.log(JSON.stringify({
+  backend: tf.getBackend(),
   forwardMs: Number(medianForwardMs.toFixed(2)),
   evalsPerSec: Number((1000 / medianForwardMs).toFixed(2)),
-  mctsVisits: analysis.rootVisits,
+  mctsTotalVisits: analysis.rootVisits,
+  mctsCompletedVisits: completedVisits,
   mctsSearchMs: Number(searchElapsed.toFixed(2)),
   mctsVisitsPerSec: Number(visitsPerSec.toFixed(2)),
   topMovePrior: Number((analysis.moves[0]?.prior ?? 0).toFixed(4)),
