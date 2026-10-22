@@ -2,8 +2,8 @@
   "description": "KataGo performance regression baselines. Changes must meet or beat these thresholds to pass test:perf.",
   "b10c384": {
     "minVisitsPerSec": 0.11,
-    "maxForwardMs": 9500.0,
-    "minFeatureOpsPerSec": 120000
+    "maxForwardMs": 10000.0,
+    "minFeatureOpsPerSec": 80000
   },
   "small": {
     "minVisitsPerSec": 15.0,

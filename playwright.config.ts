@@ -10,8 +10,7 @@ export default defineConfig({
     launchOptions: {
       args: [
         '--enable-unsafe-webgpu',
-        '--enable-features=Vulkan,DefaultANGLEVulkan,VulkanFromANGLE',
-        '--use-angle=vulkan',
+        '--js-flags=--experimental-wasm-jspi',
       ],
     },
   },

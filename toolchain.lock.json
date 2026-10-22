@@ -1,0 +1,57 @@
+{
+  "$schema": "./docs/pattern-c/toolchain-lock.schema.json",
+  "name": "katago-web-toolchain-lock",
+  "version": "1.0.0",
+  "timestamp": "2026-10-21T15:48:50-07:00",
+  "upstream": {
+    "repository": "https://github.com/lightvector/KataGo.git",
+    "version": "v1.18.1",
+    "commit": "92ee95c0a4b25fec214da00951ab69e97e207729",
+    "license": "MIT",
+    "selectionReason": "Latest release fully matching verified ONNX exporter and golden test fixtures. v1.18.2 changed only NVIDIA CUDA FlashMMA kernels and documentation."
+  },
+  "exporter": {
+    "version": "v1.18.1",
+    "commit": "92ee95c0a4b25fec214da00951ab69e97e207729",
+    "binarySha256": "629dc2c770dedf1a2c137eb803929cd4f3dac5804e3c17e847041c5a4a16bccc",
+    "archiveUrl": "https://github.com/lightvector/KataGo/releases/download/v1.18.1/katago-v1.18.1-onnx1.24.4-directml-windows-x64.zip",
+    "archiveSha256": "cc5ab3923344a2c35b023307794850b5453f1f7ebbd80b7372bf4485d9ce37ee"
+  },
+  "compilers": {
+    "emscripten": "3.1.74",
+    "clang": "20.0.0git (322eb1a92e6d4266184060346616fa0dbe39e731)",
+    "target": "wasm32-unknown-emscripten",
+    "cmake": "4.4.4",
+    "ninja": "1.13.2",
+    "node": "22.14.0",
+    "python": "3.14.7"
+  },
+  "npmPackages": {
+    "onnxruntime-web": "1.30.0",
+    "typescript": "5.9.3",
+    "vitest": "4.1.8",
+    "@playwright/test": "1.64.1",
+    "fast-check": "4.10.2",
+    "pako": "2.1.0"
+  },
+  "nativeBuildFlags": {
+    "optLevel": "-O3",
+    "simd": "-msimd128",
+    "threads": "-pthread",
+    "allocator": "-sMALLOC=mimalloc",
+    "filesystem": "-sWASMFS",
+    "zlib": "-sUSE_ZLIB=1",
+    "jspi": "-sJSPI=1",
+    "moduleFormat": "-sEXPORT_ES6=1 -sMODULARIZE=1"
+  },
+  "models": {
+    "baselineSmallTransformer": {
+      "name": "kata1-tf2-b10c384-s2941M-d5872M.bin.gz",
+      "sourceSha256": "8015d49bdf45854c94e5f9e22b2b70e8738d3e56a6edca730e5b82509998a5b5",
+      "exportedOnnxSha256": "c306a252a2909859c52d4d2ab433ac89ba051f8f2606850df2f747203e5974e3",
+      "dimensions": { "width": 19, "height": 19 },
+      "transformerNhwc": true,
+      "masking": true
+    }
+  }
+}

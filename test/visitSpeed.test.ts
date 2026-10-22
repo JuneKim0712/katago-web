@@ -74,7 +74,7 @@ describe.skipIf(!selectedModelPath)('MCTS Visit-Speed & Performance Enforcement'
     const outSpatial = new Float32Array(361 * 22);
     const outGlobal = new Float32Array(19);
 
-    const WARMUP_ITERS = 1000;
+    const WARMUP_ITERS = 5000;
     for (let i = 0; i < WARMUP_ITERS; i++) {
       fillInputsV7Fast({
         stones,

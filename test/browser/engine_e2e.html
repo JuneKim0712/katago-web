@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Pattern C Engine E2E Browser Test</title>
+</head>
+<body>
+  <h1>KataGo Web Pattern C Browser Test</h1>
+  <div id="status">Starting...</div>
+  <pre id="output"></pre>
+  <script type="module">
+    import { createEngine } from '/dist/client/engine.js';
+    import { BASELINE_B10C384_MANIFEST } from '/dist/models/manifest.js';
+
+    window.testLogs = [];
+    window.testEvents = [];
+    window.testResult = null;
+    window.testError = null;
+    window.testFinished = false;
+    window.testSuccess = false;
+
+    function log(msg) {
+      console.log(msg);
+      window.testLogs.push(msg);
+      document.getElementById('status').innerText = msg;
+    }
+
+    async function runTest() {
+      try {
+        log('Creating KataGo engine...');
+        const engine = createEngine({
+          workerFactory: () => new Worker('/dist/worker/coordinator.worker.js', { type: 'module' }),
+        });
+
+        // 1. Inspect capabilities
+        log('Inspecting capabilities...');
+        const caps = await engine.inspectCapabilities();
+        log('Capabilities: ' + JSON.stringify(caps));
+
+        // 2. Subscribe to events
+        engine.subscribe((event) => {
+          window.testEvents.push(event);
+          log('Engine event: ' + event.type + (event.type === 'load-progress' ? ' ' + event.stage : ''));
+        });
+
+        // 3. Initialize engine
+        log('Initializing engine with official b10c384 model...');
+        const info = await engine.initialize({
+          operationId: 'e2e-op-1',
+          model: { kind: 'manifest', manifest: BASELINE_B10C384_MANIFEST },
+          runtime: { accelerator: 'webgpu', fallback: 'forbid' },
+        });
+        log('Engine ready: ' + JSON.stringify(info));
+
+        // 4. Run Analysis
+        log('Analyzing empty 19x19 board for 10 visits...');
+        const analyzeReq = {
+          apiVersion: 1,
+          requestId: 'e2e-req-1',
+          position: {
+            kind: 'game',
+            dimensions: { width: 19, height: 19 },
+            initialStones: [],
+            initialPlayer: 'black',
+            moves: [],
+            rules: { kind: 'preset', name: 'chinese' },
+            komi: 7.5,
+            handicap: { countOverride: null, inferFromInitialBlackMoves: false },
+          },
+          search: {
+            profile: 'upstream-analysis-v1',
+            limits: { kind: 'visits', maxVisits: 10 },
+            seed: 'e2e-seed-1',
+            batchSize: 4,
+            searchThreads: 2,
+            conservativePass: false,
+            wideRootNoise: 0.0,
+            rootSymmetrySamples: 1,
+            allowedRootMoves: null,
+          },
+          output: {
+            maxCandidates: 5,
+            pvLength: 5,
+            includePolicy: true,
+            ownership: 'root',
+            includeOwnershipStdev: false,
+            includeCandidateOwnership: false,
+            progressIntervalMs: 50,
+          },
+        };
+
+        const result = await engine.analyze(analyzeReq);
+        log('Analysis completed! Visits: ' + result.snapshot.rootVisits);
+        window.testResult = result;
+
+        // 5. Clean teardown
+        log('Disposing engine...');
+        await engine.dispose();
+        log('Engine disposed cleanly.');
+
+        window.testSuccess = true;
+      } catch (err) {
+        log('Test error: ' + (err.stack || err.message));
+        window.testError = err.message || String(err);
+        window.testSuccess = false;
+      } finally {
+        window.testFinished = true;
+      }
+    }
+
+    runTest();
+  </script>
+</body>
+</html>

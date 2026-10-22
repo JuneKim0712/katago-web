@@ -71,7 +71,7 @@ export class KataGoEngineClient {
   private spawnWorker(): Worker {
     let worker: Worker;
     try {
-      worker = new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' });
+      worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
     } catch (err) {
       throw formatWorkerError(err, 'KataGo worker failed to start');
     }

@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>KataGo TFJS vs ONNX Runtime WebGPU Benchmark Harness</title>
+</head>
+<body>
+  <div id="status">Ready</div>
+  <pre id="output"></pre>
+
+  <script type="module">
+    function runWorkerBlock(workerPath, initPayload, runPayload) {
+      return new Promise((resolve, reject) => {
+        const worker = new Worker(workerPath, { type: 'module' });
+        let reqId = 0;
+        const pending = new Map();
+
+        worker.onmessage = (e) => {
+          if (e.data.error) {
+            worker.terminate();
+            reject(new Error(e.data.error + '\n' + (e.data.stack || '')));
+            return;
+          }
+          const resolver = pending.get(e.data.id);
+          if (resolver) {
+            pending.delete(e.data.id);
+            resolver(e.data);
+          }
+        };
+
+        worker.onerror = (err) => {
+          worker.terminate();
+          reject(err);
+        };
+
+        function send(payload) {
+          return new Promise((res) => {
+            const id = ++reqId;
+            pending.set(id, res);
+            worker.postMessage({ ...payload, id });
+          });
+        }
+
+        (async () => {
+          try {
+            const initRes = await send({ action: 'init', ...initPayload });
+            const runRes = await send({ action: 'run', ...runPayload });
+            await send({ action: 'dispose' });
+            worker.terminate();
+            resolve({
+              loadMs: initRes.loadMs,
+              warmupMs: runRes.warmupMs,
+              timings: runRes.timings,
+              outputs: runRes.outputs,
+              backend: initRes.backend,
+            });
+          } catch (err) {
+            worker.terminate();
+            reject(err);
+          }
+        })();
+      });
+    }
+
+    window.runBenchmark = async (config) => {
+      const statusEl = document.getElementById('status');
+      const outputEl = document.getElementById('output');
+      const log = (msg) => {
+        statusEl.textContent = msg;
+        outputEl.textContent += msg + '\n';
+        console.log('[Harness]', msg);
+      };
+
+      const results = {
+        meta: {
+          userAgent: navigator.userAgent,
+          timestamp: new Date().toISOString(),
+          warmupCount: config.warmupCount || 10,
+          iterationCount: config.iterationCount || 50,
+        },
+        batchResults: {},
+      };
+
+      const singleSpatial = new Float32Array(config.featureData.spatial);
+      const singleGlobal = new Float32Array(config.featureData.global);
+
+      for (const batchSize of config.batchSizes) {
+        log(`\n=== Benchmarking Batch Size ${batchSize} ===`);
+
+        // Prepare repeated batch arrays
+        const batchSpatial = new Float32Array(batchSize * 19 * 19 * 22);
+        const batchGlobal = new Float32Array(batchSize * 19);
+        for (let b = 0; b < batchSize; b++) {
+          batchSpatial.set(singleSpatial, b * 19 * 19 * 22);
+          batchGlobal.set(singleGlobal, b * 19);
+        }
+
+        const runPlan = [
+          { runtime: 'TFJS', worker: '/benchmarks/onnx-vs-tfjs/tfjs-worker.js', modelUrl: config.modelUrlTfjs, block: 1 },
+          { runtime: 'ORT',  worker: '/benchmarks/onnx-vs-tfjs/ort-worker.js',  modelUrl: config.modelUrlOrt,  block: 1 },
+          { runtime: 'ORT',  worker: '/benchmarks/onnx-vs-tfjs/ort-worker.js',  modelUrl: config.modelUrlOrt,  block: 2 },
+          { runtime: 'TFJS', worker: '/benchmarks/onnx-vs-tfjs/tfjs-worker.js', modelUrl: config.modelUrlTfjs, block: 2 },
+        ];
+
+        const blockResults = [];
+
+        for (const item of runPlan) {
+          log(`Running ${item.runtime} Block ${item.block} (batch ${batchSize})...`);
+          const blockStart = performance.now();
+          const blockData = await runWorkerBlock(
+            item.worker,
+            { modelUrl: item.modelUrl },
+            {
+              batchSize,
+              warmupCount: config.warmupCount || 10,
+              iterationCount: config.iterationCount || 50,
+              spatial: batchSpatial,
+              global: batchGlobal,
+            }
+          );
+          const totalBlockMs = performance.now() - blockStart;
+
+          // Compute percentiles for block
+          const sorted = [...blockData.timings].sort((a, b) => a - b);
+          const median = sorted[Math.floor(sorted.length / 2)];
+          const p95 = sorted[Math.floor(sorted.length * 0.95)];
+          const sumElapsed = sorted.reduce((a, b) => a + b, 0);
+          const observedPosPerSec = (batchSize * sorted.length * 1000) / sumElapsed;
+          const medianPosPerSec = (batchSize * 1000) / median;
+
+          log(`  Completed in ${totalBlockMs.toFixed(1)}ms (load: ${blockData.loadMs.toFixed(1)}ms, warmup: ${blockData.warmupMs.toFixed(1)}ms)`);
+          log(`  Median: ${median.toFixed(2)}ms, p95: ${p95.toFixed(2)}ms, Observed pos/sec: ${observedPosPerSec.toFixed(2)}`);
+
+          blockResults.push({
+            runtime: item.runtime,
+            blockIndex: item.block,
+            loadMs: blockData.loadMs,
+            warmupMs: blockData.warmupMs,
+            medianBatchMs: median,
+            p95BatchMs: p95,
+            sumElapsedMs: sumElapsed,
+            observedPosPerSec,
+            medianPosPerSec,
+            timings: blockData.timings,
+            outputs: blockData.outputs,
+          });
+
+          // Allow GPU and memory to settle before starting next block
+          await new Promise((r) => setTimeout(r, 200));
+        }
+
+        results.batchResults[batchSize] = blockResults;
+      }
+
+      log('\nBenchmark completed successfully.');
+      return results;
+    };
+  </script>
+</body>
+</html>

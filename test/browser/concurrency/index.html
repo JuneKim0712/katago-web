@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>JSPI + Pthread Concurrency Gate</title>
+</head>
+<body>
+  <h1>Concurrency Gate Verification</h1>
+  <div id="status">Initializing...</div>
+  <pre id="log"></pre>
+
+  <script type="module">
+    const statusEl = document.getElementById('status');
+    const logEl = document.getElementById('log');
+
+    function log(msg) {
+      logEl.textContent += JSON.stringify(msg) + '\n';
+      console.log('[UI]', msg);
+    }
+
+    window.testEvents = [];
+    window.testFinished = false;
+    window.testSuccess = false;
+
+    const worker = new Worker(new URL('./coordinator.js', import.meta.url), { type: 'module' });
+    window.worker = worker;
+
+    worker.onmessage = (e) => {
+      const msg = e.data;
+      window.testEvents.push(msg);
+      log(msg);
+
+      if (msg.type === 'ready') {
+        statusEl.textContent = 'Worker Ready. Starting test...';
+        worker.postMessage({ cmd: 'start' });
+      } else if (msg.type === 'success') {
+        statusEl.textContent = 'SUCCESS: ' + JSON.stringify(msg);
+        window.testFinished = true;
+        window.testSuccess = true;
+      } else if (msg.type === 'failure' || msg.type === 'error') {
+        statusEl.textContent = 'FAILED: ' + JSON.stringify(msg);
+        window.testFinished = true;
+        window.testSuccess = false;
+      }
+    };
+
+    worker.postMessage({ cmd: 'init' });
+  </script>
+</body>
+</html>

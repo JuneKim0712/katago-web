@@ -1,0 +1,256 @@
+{
+  "hardware": {
+    "gpu": "intel xe-2lpg",
+    "adapterLimits": {
+      "maxComputeWorkgroupStorageSize": 32768,
+      "maxComputeInvocationsPerWorkgroup": 1024,
+      "maxBufferSize": 2147483648,
+      "maxStorageBufferBindingSize": 2147483644
+    },
+    "os": "win32",
+    "browser": "Chrome 155.0.8059.86"
+  },
+  "model": {
+    "source": "C:/Users/junwo/Downloads/kata1-tf2-b10c384-s2941M-d5872M.bin.gz",
+    "sourceSha256": "8015d49bdf45854c94e5f9e22b2b70e8738d3e56a6edca730e5b82509998a5b5",
+    "onnx": "C:/Users/junwo/.gemini/antigravity/scratch/kata1-b10c384.onnx",
+    "onnxSha256": "c306a252a2909859c52d4d2ab433ac89ba051f8f2606850df2f747203e5974e3"
+  },
+  "numericalAgreement": {
+    "winRateDiff": 1.816911370244867e-7,
+    "scoreLeadDiff": 0.00000300304710937338,
+    "scoreMeanDiff": 0.0000018966512040086148,
+    "maxPolicyProbDiff": 3.813411876274486e-7,
+    "meanPolicyProbDiff": 3.7109385414114817e-9,
+    "maxOwnershipDiff": 0.0000011610996557415154,
+    "meanOwnershipDiff": 2.106384330332657e-7,
+    "top5Tf": [
+      320,
+      306,
+      263,
+      78,
+      62
+    ],
+    "top5Ort": [
+      320,
+      306,
+      263,
+      78,
+      62
+    ],
+    "top5Native": [
+      320,
+      306,
+      263,
+      78,
+      62
+    ],
+    "top5Agreement": true,
+    "tfjsWinProb": 0.5245495298739966,
+    "ortWinProb": 0.5245497115651336,
+    "nativeWinProb": 0.524553,
+    "tfjsLead": 0.14243219044451336,
+    "ortLead": 0.14243519349162273,
+    "nativeLead": 0.142
+  },
+  "batches": {
+    "1": {
+      "batchSize": 1,
+      "blocks": [
+        {
+          "runtime": "TFJS",
+          "blockIndex": 1,
+          "loadMs": 698.3999999761581,
+          "warmupMs": 826.5999999642372,
+          "medianBatchMs": 25.69999998807907,
+          "p95BatchMs": 28.19999998807907,
+          "observedPosPerSec": 39.04114936998389,
+          "medianPosPerSec": 38.91050585462449
+        },
+        {
+          "runtime": "ORT",
+          "blockIndex": 1,
+          "loadMs": 2050.400000035763,
+          "warmupMs": 1895.0999999642372,
+          "medianBatchMs": 102.09999996423721,
+          "p95BatchMs": 117.5,
+          "observedPosPerSec": 9.910213465974643,
+          "medianPosPerSec": 9.794319298239689
+        },
+        {
+          "runtime": "ORT",
+          "blockIndex": 2,
+          "loadMs": 1935.2999999523163,
+          "warmupMs": 1741.8999999761581,
+          "medianBatchMs": 88.80000001192093,
+          "p95BatchMs": 100.30000001192093,
+          "observedPosPerSec": 11.495574203931486,
+          "medianPosPerSec": 11.261261259749496
+        },
+        {
+          "runtime": "TFJS",
+          "blockIndex": 2,
+          "loadMs": 671.5999999642372,
+          "warmupMs": 829.3000000119209,
+          "medianBatchMs": 24.19999998807907,
+          "p95BatchMs": 40.39999997615814,
+          "observedPosPerSec": 39.218762256596634,
+          "medianPosPerSec": 41.322314069942166
+        }
+      ],
+      "pooled": {
+        "tfjs": {
+          "medianBatchMs": 24.899999976158142,
+          "p95BatchMs": 28.5,
+          "observedPosPerSec": 39.129754264778164,
+          "medianPosPerSec": 40.16064260873512
+        },
+        "ort": {
+          "medianBatchMs": 93.60000002384186,
+          "p95BatchMs": 116.30000001192093,
+          "observedPosPerSec": 10.644186145513807,
+          "medianPosPerSec": 10.683760681039308
+        },
+        "comparison": {
+          "fasterRuntime": "TFJS",
+          "speedupFactor": 0.2660256407031581,
+          "throughputIncreasePercent": -73.39743592968419,
+          "latencyReductionPercent": -275.9036149135111,
+          "conclusive": true
+        }
+      }
+    },
+    "4": {
+      "batchSize": 4,
+      "blocks": [
+        {
+          "runtime": "TFJS",
+          "blockIndex": 1,
+          "loadMs": 737.4000000357628,
+          "warmupMs": 1390.2000000476837,
+          "medianBatchMs": 84.79999995231628,
+          "p95BatchMs": 99.20000004768372,
+          "observedPosPerSec": 48.246248853735366,
+          "medianPosPerSec": 47.169811347278674
+        },
+        {
+          "runtime": "ORT",
+          "blockIndex": 1,
+          "loadMs": 2022.6000000238419,
+          "warmupMs": 2762.800000011921,
+          "medianBatchMs": 258.60000002384186,
+          "p95BatchMs": 284.30000001192093,
+          "observedPosPerSec": 15.387574533564147,
+          "medianPosPerSec": 15.467904097568509
+        },
+        {
+          "runtime": "ORT",
+          "blockIndex": 2,
+          "loadMs": 1964.300000011921,
+          "warmupMs": 4489.600000023842,
+          "medianBatchMs": 321.9000000357628,
+          "p95BatchMs": 378.0999999642372,
+          "observedPosPerSec": 12.394338266298277,
+          "medianPosPerSec": 12.426219321390505
+        },
+        {
+          "runtime": "TFJS",
+          "blockIndex": 2,
+          "loadMs": 724.6999999880791,
+          "warmupMs": 1257.3999999761581,
+          "medianBatchMs": 78.69999998807907,
+          "p95BatchMs": 91.30000001192093,
+          "observedPosPerSec": 50.35246726711828,
+          "medianPosPerSec": 50.825921227520865
+        }
+      ],
+      "pooled": {
+        "tfjs": {
+          "medianBatchMs": 84.19999998807907,
+          "p95BatchMs": 97.09999996423721,
+          "observedPosPerSec": 49.27686204739844,
+          "medianPosPerSec": 47.505938249006114
+        },
+        "ort": {
+          "medianBatchMs": 295.30000001192093,
+          "p95BatchMs": 339.5999999642372,
+          "observedPosPerSec": 13.729710062858983,
+          "medianPosPerSec": 13.545546900909327
+        },
+        "comparison": {
+          "fasterRuntime": "TFJS",
+          "speedupFactor": 0.28513376222377246,
+          "throughputIncreasePercent": -71.48662377762275,
+          "latencyReductionPercent": -250.71258913744555,
+          "conclusive": true
+        }
+      }
+    },
+    "8": {
+      "batchSize": 8,
+      "blocks": [
+        {
+          "runtime": "TFJS",
+          "blockIndex": 1,
+          "loadMs": 788.9000000357628,
+          "warmupMs": 1838.7000000476837,
+          "medianBatchMs": 131.30000001192093,
+          "p95BatchMs": 145.19999998807907,
+          "observedPosPerSec": 60.552847497544306,
+          "medianPosPerSec": 60.92916983452908
+        },
+        {
+          "runtime": "ORT",
+          "blockIndex": 1,
+          "loadMs": 2352.400000035763,
+          "warmupMs": 4415.699999988079,
+          "medianBatchMs": 386.19999998807907,
+          "p95BatchMs": 439.4000000357628,
+          "observedPosPerSec": 20.49999487507643,
+          "medianPosPerSec": 20.71465561948974
+        },
+        {
+          "runtime": "ORT",
+          "blockIndex": 2,
+          "loadMs": 2140.300000011921,
+          "warmupMs": 4463.200000047684,
+          "medianBatchMs": 409.69999998807907,
+          "p95BatchMs": 438.4000000357628,
+          "observedPosPerSec": 19.547284882198195,
+          "medianPosPerSec": 19.526482792855195
+        },
+        {
+          "runtime": "TFJS",
+          "blockIndex": 2,
+          "loadMs": 711.3999999761581,
+          "warmupMs": 1789,
+          "medianBatchMs": 133,
+          "p95BatchMs": 150.5,
+          "observedPosPerSec": 59.55305432843647,
+          "medianPosPerSec": 60.150375939849624
+        }
+      ],
+      "pooled": {
+        "tfjs": {
+          "medianBatchMs": 132.5,
+          "p95BatchMs": 146.5,
+          "observedPosPerSec": 60.0487896421211,
+          "medianPosPerSec": 60.37735849056604
+        },
+        "ort": {
+          "medianBatchMs": 399.5,
+          "p95BatchMs": 439.4000000357628,
+          "observedPosPerSec": 20.012307569226643,
+          "medianPosPerSec": 20.02503128911139
+        },
+        "comparison": {
+          "fasterRuntime": "TFJS",
+          "speedupFactor": 0.3316645807259074,
+          "throughputIncreasePercent": -66.83354192740927,
+          "latencyReductionPercent": -201.50943396226415,
+          "conclusive": true
+        }
+      }
+    }
+  }
+}

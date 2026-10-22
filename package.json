@@ -2,19 +2,25 @@
   "name": "katago-web",
   "version": "1.0.0",
   "description": "High-performance KataGo AI analysis and neural network inference in pure TypeScript / WebGPU / WASM",
-  "main": "./dist/index.cjs",
+  "main": "./dist/index.js",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "require": "./dist/index.cjs"
+      "import": "./dist/index.js"
+    },
+    "./coordinator": {
+      "types": "./dist/worker/coordinator.worker.d.ts",
+      "import": "./dist/worker/coordinator.worker.js"
     },
     "./worker": {
       "types": "./dist/worker/worker.d.ts",
-      "import": "./dist/worker/worker.js",
-      "require": "./dist/worker/worker.cjs"
+      "import": "./dist/worker/worker.js"
+    },
+    "./contracts": {
+      "types": "./dist/contracts.d.ts",
+      "import": "./dist/contracts.js"
     }
   },
   "type": "module",
@@ -51,9 +57,11 @@
     "@tensorflow/tfjs": "^4.22.0",
     "@tensorflow/tfjs-backend-wasm": "^4.22.0",
     "@tensorflow/tfjs-backend-webgpu": "^4.22.0",
+    "onnxruntime-web": "1.30.0",
     "pako": "^2.1.0"
   },
   "devDependencies": {
+    "@playwright/test": "1.64.1",
     "@types/node": "^24.10.13",
     "@types/pako": "^2.0.4",
     "fast-check": "4.10.2",
