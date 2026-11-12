@@ -44,7 +44,8 @@ class KataGoEngineImpl implements KataGoEngine {
         this.worker = this.options.workerFactory();
       } else {
         // Default Web Worker instantiation
-        this.worker = new Worker(new URL('../worker/coordinator.worker.js', import.meta.url), /* @vite-ignore */ {
+        const workerUrl = new URL('../worker/coordinator.worker.js', import.meta.url);
+        this.worker = new Worker(workerUrl, {
           type: 'module',
         });
       }

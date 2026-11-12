@@ -1507,6 +1507,92 @@ export class MctsSearch {
     }
   }
 
+  /**
+   * Advances the search tree by playing a move.
+   * If a child node matching move exists and has visits > 0, promotes that child to root,
+   * unlinks unselected branches for garbage collection, and updates internal board state.
+   * Returns true if the subtree was successfully reused, or false if a fresh search is required.
+   */
+  advanceToMove(args: {
+    move: number;
+    player: Player;
+    board: BoardState;
+    koPoint?: number;
+  }): boolean {
+    if (this.isRunning) return false;
+    const edges = this.rootNode.edges;
+    if (!edges || edges.length === 0) return false;
+
+    const targetEdge = edges.find((e) => e.move === args.move);
+    if (!targetEdge || !targetEdge.child || targetEdge.child.visits <= 0) {
+      return false;
+    }
+
+    const promoted = targetEdge.child;
+
+    // Unlink discarded branches to allow V8 to garbage collect them immediately
+    for (const edge of edges) {
+      if (edge !== targetEdge) {
+        edge.child = null;
+      }
+    }
+    this.rootNode.edges = null;
+
+    // Update root references
+    this.rootNode = promoted;
+    this.currentPlayer = colorToPlayer(opponentOf(playerToColor(args.player)));
+
+    this.rootPrevStones = this.rootStones;
+    this.rootPrevKoPoint = this.rootKoPoint;
+    this.rootStones = boardStateToStones(args.board);
+    this.rootKoPoint = args.koPoint ?? -1;
+    this.rootMoves.push({ move: args.move, player: args.player });
+
+    this.rootPrevLibertyMap = this.rootLibertyMap;
+    this.rootLibertyMap = computeLibertyMapInto(this.rootStones, new Uint8Array(BOARD_AREA));
+
+    // Update self-play scalars for root statistics calculation
+    const v = promoted.visits;
+    this.rootSelfValue = promoted.valueSum / v;
+    this.rootSelfScoreLead = promoted.scoreLeadSum / v;
+    this.rootSelfScoreMean = promoted.scoreMeanSum / v;
+    this.rootSelfScoreMeanSq = promoted.scoreMeanSqSum / v;
+    this.rootSelfUtility = promoted.nnUtility ?? (promoted.utilitySum / v);
+
+    // Reconstruct root policy from promoted node's expanded edges
+    if (promoted.edges) {
+      this.rootPolicy.fill(-1);
+      for (const edge of promoted.edges) {
+        this.rootPolicy[edge.move] = edge.prior;
+      }
+    }
+
+    if (promoted.ownership) {
+      this.rootOwnership = promoted.ownership;
+    }
+
+    this.recentScoreCenter = computeRecentScoreCenter(-this.rootSelfScoreMean);
+    this.treeOwnershipCache = null;
+
+    return true;
+  }
+
+  getRootVisits(): number {
+    return this.rootNode.visits;
+  }
+
+  getCurrentPlayer(): Player {
+    return this.currentPlayer;
+  }
+
+  getRootStones(): Uint8Array<ArrayBuffer> {
+    return this.rootStones;
+  }
+
+  getRootKoPoint(): number {
+    return this.rootKoPoint;
+  }
+
   getAnalysisLight(args: {
     topK: number;
     analysisPvLen: number;

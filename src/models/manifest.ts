@@ -1,5 +1,5 @@
-import { ModelArtifact, ModelManifest, ModelSource } from '../api/types';
-import { failRequest } from '../api/validation';
+import { ModelArtifact, ModelManifest, ModelSource } from '../api/types.js';
+import { failRequest } from '../api/validation.js';
 
 export const BASELINE_MODEL_ID = 'b10c384-default';
 export const BASELINE_MODEL_SHA256 = 'c306a252a2909859c52d4d2ab433ac89ba051f8f2606850df2f747203e5974e3';

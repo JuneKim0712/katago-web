@@ -112,6 +112,55 @@ export class SearchSession {
   }
 
   /**
+   * Advances the search tree by playing move at loc.
+   * If a corresponding child node with visits exists, promotes it as the new root,
+   * retaining existing search visits. Otherwise, initializes a fresh root.
+   * Returns the number of reused visits inherited by the new root.
+   */
+  makeMove(loc: number): number {
+    const nextPlayer = this.history.currentPlayer;
+    // Advance internal board history
+    this.history.makeMove(loc, nextPlayer);
+
+    let reusedVisits = 0;
+    if (this.root && this.root.isExpanded) {
+      const child = this.root.children.find((c) => c.loc === loc);
+      if (child && child.visits > 0) {
+        reusedVisits = child.visits;
+        // Decouple unselected siblings for GC
+        this.root.children = [];
+        this.root = child;
+      } else {
+        this.root = this.createNode(loc, nextPlayer, 1.0);
+      }
+    } else {
+      this.root = this.createNode(loc, nextPlayer, 1.0);
+    }
+
+    return reusedVisits;
+  }
+
+  /**
+   * Executes MCTS visits until rootVisits reaches maxVisits.
+   * If the root already has >= maxVisits (e.g. from reused visits),
+   * no additional evaluations are executed and the current report is returned.
+   */
+  async runUntilVisits(maxVisits: number): Promise<SearchReport> {
+    if (!this.root.isExpanded) {
+      await this.expandNode(this.root, this.history);
+    }
+    const needed = Math.max(0, maxVisits - this.root.visits);
+    if (needed === 0) {
+      return this.getReport();
+    }
+    return this.runVisits(needed);
+  }
+
+  getRootVisits(): number {
+    return this.root.visits;
+  }
+
+  /**
    * Expands a leaf node by extracting features, evaluating with EvaluationBackend, and filtering illegal moves.
    */
   private async expandNode(node: SearchNode, simHistory: BoardHistory): Promise<void> {

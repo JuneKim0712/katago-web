@@ -10,7 +10,7 @@ import {
   Rules,
   RulesInput,
   StonePlacement,
-} from './types';
+} from './types.js';
 
 export function makeEngineFailure(
   code: EngineFailure['code'],

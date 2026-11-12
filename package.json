@@ -31,6 +31,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "prepublishOnly": "npm run typecheck && npm run build",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "bench": "vitest run test/performance.test.ts",

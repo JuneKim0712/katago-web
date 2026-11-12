@@ -39,6 +39,18 @@ static std::atomic<bool> g_isAnalyzing{false};
 static std::string g_currentRequestId;
 static std::mutex g_botMutex;
 
+struct PreviousSearchState {
+  bool valid = false;
+  int boardXSize = 0;
+  int boardYSize = 0;
+  Rules rules;
+  Player initialPlayer = P_BLACK;
+  std::vector<std::pair<Player, Loc>> initialStones;
+  std::vector<std::pair<Player, Loc>> moves;
+};
+
+static PreviousSearchState g_prevSearchState;
+
 extern "C" {
 
 EMSCRIPTEN_KEEPALIVE
@@ -165,6 +177,7 @@ static void run_search_task(string query_str) {
     }
 
     // Initial stones
+    std::vector<std::pair<Player, Loc>> currInitialStones;
     if(q.contains("initialStones") && q["initialStones"].is_array()) {
       for(const auto& item : q["initialStones"]) {
         if(item.is_array() && item.size() >= 2) {
@@ -173,6 +186,7 @@ static void run_search_task(string query_str) {
           string locStr = item[1].get<string>();
           Loc loc = Location::ofString(locStr, boardXSize, boardYSize);
           board.setStone(loc, p);
+          currInitialStones.push_back(std::make_pair(p, loc));
         }
       }
     }
@@ -230,6 +244,7 @@ static void run_search_task(string query_str) {
     BoardHistory hist(board, nextPla, rules, 0, historyModes);
 
     // Moves replay
+    std::vector<std::pair<Player, Loc>> currMoves;
     if(q.contains("moves") && q["moves"].is_array()) {
       for(const auto& item : q["moves"]) {
         if(item.is_array() && item.size() >= 2) {
@@ -237,6 +252,7 @@ static void run_search_task(string query_str) {
           Player p = (pStr == "w" || pStr == "W" || pStr == "white") ? P_WHITE : P_BLACK;
           string locStr = item[1].get<string>();
           Loc loc = Location::ofString(locStr, boardXSize, boardYSize);
+          currMoves.push_back(std::make_pair(p, loc));
           if(p != nextPla) {
             board.clearSimpleKoLoc();
             hist.clear(board, p, rules, hist.encorePhase);
@@ -274,6 +290,37 @@ static void run_search_task(string query_str) {
       }
     }
 
+    // Check tree reuse eligibility (1-move forward extension matching existing search tree)
+    bool canReuse = false;
+    Loc moveLocToAdvance = Board::NULL_LOC;
+    Player movePlaToAdvance = C_EMPTY;
+
+    Player initialPla = (q.contains("initialPlayer") && (q["initialPlayer"] == "w" || q["initialPlayer"] == "W" || q["initialPlayer"] == "white" || q["initialPlayer"] == "WHITE")) ? P_WHITE : P_BLACK;
+
+    if (g_prevSearchState.valid &&
+        boardXSize == g_prevSearchState.boardXSize &&
+        boardYSize == g_prevSearchState.boardYSize &&
+        rules == g_prevSearchState.rules &&
+        initialPla == g_prevSearchState.initialPlayer &&
+        currInitialStones == g_prevSearchState.initialStones &&
+        currMoves.size() == g_prevSearchState.moves.size() + 1) {
+      bool prefixMatches = true;
+      for (size_t i = 0; i < g_prevSearchState.moves.size(); i++) {
+        if (currMoves[i].first != g_prevSearchState.moves[i].first ||
+            currMoves[i].second != g_prevSearchState.moves[i].second) {
+          prefixMatches = false;
+          break;
+        }
+      }
+      if (prefixMatches) {
+        canReuse = true;
+        movePlaToAdvance = currMoves.back().first;
+        moveLocToAdvance = currMoves.back().second;
+      }
+    }
+
+    int64_t reusedVisits = 0;
+
     // Configure bot under mutex lock, then release before searching
     {
       std::lock_guard<std::mutex> lock(g_botMutex);
@@ -286,7 +333,20 @@ static void run_search_task(string query_str) {
         return;
       }
 
-      g_bot->setPosition(nextPla, board, hist);
+      bool reusedSuccessfully = false;
+      if (canReuse && g_bot->getSearch() && g_bot->getSearch()->getRootNode() != nullptr) {
+        bool moved = g_bot->makeMove(moveLocToAdvance, movePlaToAdvance);
+        if (moved) {
+          reusedSuccessfully = true;
+          reusedVisits = g_bot->getSearch()->getRootVisits();
+        }
+      }
+
+      if (!reusedSuccessfully) {
+        g_bot->setPosition(nextPla, board, hist);
+        reusedVisits = 0;
+      }
+
       g_bot->setAlwaysIncludeOwnerMap(includeOwnership || includeOwnershipStdev);
       g_bot->setParams(params);
       if(hasAvoidRestrictions) {
@@ -297,7 +357,7 @@ static void run_search_task(string query_str) {
     Player pla = nextPla;
     double searchFactor = 1.0;
 
-    auto reportSnapshot = [id, analysisPVLen, includePolicy, includeOwnership, includeOwnershipStdev](const Search* search, bool isDuringSearch) {
+    auto reportSnapshot = [id, analysisPVLen, includePolicy, includeOwnership, includeOwnershipStdev, reusedVisits](const Search* search, bool isDuringSearch) {
       json ret;
       ret["id"] = id;
       ret["isDuringSearch"] = isDuringSearch;
@@ -315,6 +375,7 @@ static void run_search_task(string query_str) {
         ret
       );
       if(success) {
+        ret["rootInfo"]["reusedVisits"] = reusedVisits;
         g_responseQueue.forcePush(new string(ret.dump()));
       }
       return success;
@@ -341,7 +402,15 @@ static void run_search_task(string query_str) {
     // Final result
     const Search* search = g_bot->getSearch();
     reportSnapshot(search, false);
-    g_bot->clearSearch();
+
+    // Save search state for subtree reuse on the next move
+    g_prevSearchState.valid = true;
+    g_prevSearchState.boardXSize = boardXSize;
+    g_prevSearchState.boardYSize = boardYSize;
+    g_prevSearchState.rules = rules;
+    g_prevSearchState.initialPlayer = initialPla;
+    g_prevSearchState.initialStones = currInitialStones;
+    g_prevSearchState.moves = currMoves;
   }
   catch (const std::exception& e) {
     json err;
@@ -412,6 +481,9 @@ int katago_reset() {
     g_workerThread.join();
   }
   std::lock_guard<std::mutex> lock(g_botMutex);
+  g_prevSearchState.valid = false;
+  g_prevSearchState.moves.clear();
+  g_prevSearchState.initialStones.clear();
   g_bot.reset();
   g_nnEval.reset();
   g_isAnalyzing.store(false, std::memory_order_release);

@@ -47,6 +47,7 @@ export {
   computeModelTierFromArch,
   KATAGO_MAX_CUSTOM_MODEL_BYTES,
   recommendBackendForModelSize,
+  getAnalyzeTuning,
 } from './worker/resourceProfile.js';
 export {
   formatKataGoUserError,
@@ -102,6 +103,7 @@ export {
 // Neural Network & Model Parser
 export {
   KataGoModelV8Tf,
+  ModelInputBuffers,
   type ParsedKataGoModelV8,
 } from './model/modelV8.js';
 
@@ -180,5 +182,39 @@ export {
   type SearchReport,
   type CandidateMoveResult,
 } from './core-runtime/search.js';
+
+// Heuristics, Norms, & Score Value utilities
+export { postprocessKataGoV8 } from './engine/evalV8.js';
+export { expectedWhiteScoreValue, getSqrtBoardArea } from './engine/scoreValue.js';
+export { POLICY_OPTIMISM, ROOT_POLICY_OPTIMISM } from './engine/searchParams.js';
+export { getNNKomi } from './engine/territoryKomi.js';
+export {
+  getVisitSpeedFlags,
+  withVisitSpeedProfile,
+  applyVisitSpeedProfile,
+} from './engine/visitSpeedConfig.js';
+export { transformerRmsWebGpu } from './model/rmsNormWebGpu.js';
+export { projectedRotaryWebGpu } from './model/rotaryWebGpu.js';
+export {
+  type CachedPositionResult,
+  makeCacheKey,
+  getCachedPosition,
+  setCachedPosition,
+} from './engine/positionCache.js';
+export {
+  type KataGoModelLoadStage,
+  normalizeKataGoBackendPreference,
+  getKataGoFallbackBackend,
+  getKataGoWarmupFallbackBackend,
+  shouldCacheKataGoFallbackForRequest,
+} from './worker/backendFallback.js';
+export {
+  KATAGO_RECOMMENDED_MODEL_NAME,
+  KATAGO_RECOMMENDED_MODEL_URL,
+  KATAGO_RECOMMENDED_MODEL_UPLOADED,
+  KATAGO_RECOMMENDED_MODEL_SIZE,
+  KATAGO_SMALL_MODEL_PATH,
+} from './model/modelDefaults.js';
+
 
 

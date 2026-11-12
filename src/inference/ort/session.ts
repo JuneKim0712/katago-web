@@ -46,7 +46,7 @@ import {
   readSlotDescriptor,
   SlotDescriptorView,
   validateBufferBounds,
-} from '../../runtime/abi';
+} from '../../runtime/abi.js';
 
 export interface OrtDiagnostics {
   provider: string;

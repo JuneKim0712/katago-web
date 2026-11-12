@@ -212,7 +212,7 @@ export type AnalysisSnapshot = Readonly<{
     elapsedMs: number;
     searchElapsedMs: number;
     completedNewVisits: number;
-    reusedVisits: 0; // v1 always starts a fresh search
+    reusedVisits: number;
     neuralRows: number;
     terminalVisits: number;
     neuralCacheHits: number;

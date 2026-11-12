@@ -16,13 +16,13 @@ import {
   Move,
   Ownership,
   RuntimePreference,
-} from '../api/types';
-import { OrtWebGpuSession } from '../inference/ort/session';
-import { createKatagoWasmInstance, KatagoNativeInstance } from '../runtime/loader';
-import { BASELINE_B10C384_MANIFEST, computeModelFingerprint, validateManifest } from '../models/manifest';
-import { makeEngineFailure, resolveRules } from '../api/validation';
-import { getNextPlayer, mapAnalyzeRequestToNative } from './nativeRequest';
-import { getCachedModelArtifact, putCachedModelArtifact } from '../runtime/storage';
+} from '../api/types.js';
+import { OrtWebGpuSession } from '../inference/ort/session.js';
+import { createKatagoWasmInstance, KatagoNativeInstance } from '../runtime/loader.js';
+import { BASELINE_B10C384_MANIFEST, computeModelFingerprint, validateManifest } from '../models/manifest.js';
+import { makeEngineFailure, resolveRules } from '../api/validation.js';
+import { getNextPlayer, mapAnalyzeRequestToNative } from './nativeRequest.js';
+import { getCachedModelArtifact, putCachedModelArtifact } from '../runtime/storage.js';
 
 export interface WorkerRpcRequest {
   id: string;
@@ -181,8 +181,8 @@ function mapRawSnapshotToContractV1(
     accounting: {
       elapsedMs: elapsed,
       searchElapsedMs: elapsed,
-      completedNewVisits: rootVisits,
-      reusedVisits: 0,
+      completedNewVisits: Math.max(0, rootVisits - (typeof root.reusedVisits === 'number' ? root.reusedVisits : 0)),
+      reusedVisits: typeof root.reusedVisits === 'number' ? root.reusedVisits : 0,
       neuralRows: rootVisits,
       terminalVisits: 0,
       neuralCacheHits: 0,

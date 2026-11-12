@@ -74,6 +74,7 @@ export interface KataGoAnalysisPayload {
   rootScoreSelfplay: number;
   rootScoreStdev: number;
   rootVisits: number;
+  reusedVisits?: number;
   ownership: FloatArray; // len 361, +1 black owns, -1 white owns
   ownershipStdev: FloatArray; // len 361
   policy: FloatArray; // len 362, illegal = -1, pass at index 361

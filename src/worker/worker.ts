@@ -20,7 +20,7 @@ import {
   normalizeKataGoBackendPreference,
   shouldCacheKataGoFallbackForRequest,
 } from './backendFallback.js';
-import { isGpuDeviceLostError } from './gpuError';
+import { isGpuDeviceLostError } from './gpuError.js';
 import {
   buildResourceProfile,
   generateProbeCandidates,
@@ -35,6 +35,7 @@ import {
   BLACK,
   BOARD_AREA,
   BOARD_SIZE,
+  PASS_MOVE,
   WHITE,
   setBoardSize,
 } from '../engine/fastBoard.js';
@@ -580,25 +581,56 @@ async function handleMessage(msg: KataGoWorkerRequest): Promise<void> {
     const analyzeT0 = getAnimationNow();
     klog('analyze', `#${msg.id} start | ${analysisGroup} | visits: ${maxVisits} | time: ${maxTimeMs}ms | batch: ${batchSize}`);
 
-    search = await MctsSearch.create({
-      model,
-      board: msg.board,
-      previousBoard: msg.previousBoard,
-      previousPreviousBoard: msg.previousPreviousBoard,
-      previousPreviousPreviousBoard: msg.previousPreviousPreviousBoard,
-      koPoint: msg.koPoint,
-      currentPlayer: msg.currentPlayer,
-      moveHistory: msg.moveHistory,
-      komi: msg.komi,
-      rules,
-      nnRandomize,
-      conservativePass,
-      maxChildren,
-      ownershipMode,
-      wideRootNoise,
-      rootSymmetrySamples,
-      regionOfInterest: msg.regionOfInterest,
-    });
+    let canReuse = false;
+    let reusedVisits = 0;
+
+    if (
+      search &&
+      search.model === model &&
+      search.komi === msg.komi &&
+      search.rules === rules &&
+      !msg.regionOfInterest &&
+      msg.moveHistory &&
+      msg.moveHistory.length > 0
+    ) {
+      const lastMove = msg.moveHistory[msg.moveHistory.length - 1]!;
+      if (lastMove.player === search.getCurrentPlayer()) {
+        const moveNum = lastMove.x < 0 || lastMove.y < 0 ? PASS_MOVE : lastMove.y * BOARD_SIZE + lastMove.x;
+        const advanced = search.advanceToMove({
+          move: moveNum,
+          player: lastMove.player,
+          board: msg.board,
+          koPoint: msg.koPoint,
+        });
+        if (advanced) {
+          canReuse = true;
+          reusedVisits = search.getRootVisits();
+          klog('analyze', `#${msg.id} search tree reused: ${reusedVisits} visits preserved! Target: ${maxVisits}`);
+        }
+      }
+    }
+
+    if (!canReuse) {
+      search = await MctsSearch.create({
+        model,
+        board: msg.board,
+        previousBoard: msg.previousBoard,
+        previousPreviousBoard: msg.previousPreviousBoard,
+        previousPreviousPreviousBoard: msg.previousPreviousPreviousBoard,
+        koPoint: msg.koPoint,
+        currentPlayer: msg.currentPlayer,
+        moveHistory: msg.moveHistory,
+        komi: msg.komi,
+        rules,
+        nnRandomize,
+        conservativePass,
+        maxChildren,
+        ownershipMode,
+        wideRootNoise,
+        rootSymmetrySamples,
+        regionOfInterest: msg.regionOfInterest,
+      });
+    }
 
     const releaseSearch = () => { search = null; };
 
@@ -634,11 +666,11 @@ async function handleMessage(msg: KataGoWorkerRequest): Promise<void> {
     const buildAnalysis = (forProgress = false) => {
       const args = { topK, includeMovesOwnership, analysisPvLen, ownershipRefreshIntervalMs: msg.ownershipRefreshIntervalMs };
       if (forProgress && useLightProgress) {
-        return search!.getAnalysisLight(args);
+        return { ...search!.getAnalysisLight(args), reusedVisits };
       }
       // Always clone before postMessage transfer — transferring rootOwnership /
       // rootPolicy detaches the ArrayBuffer and breaks subsequent updates.
-      return search!.getAnalysis({ ...args, cloneBuffers: true });
+      return { ...search!.getAnalysis({ ...args, cloneBuffers: true }), reusedVisits };
     };
 
     // Post root evaluation immediately so the UI shows candidate moves without
@@ -765,7 +797,6 @@ async function handleMessage(msg: KataGoWorkerRequest): Promise<void> {
         postAnalysis(buildAnalysis(), 'katago:analyze_result');
         const reason = analysis.rootVisits >= maxVisits ? 'visit cap' : 'time limit';
         klog('analyze', `#${msg.id} done | visits: ${analysis.rootVisits} | wr: ${analysis.rootWinRate.toFixed(3)} | lead: ${analysis.rootScoreLead >= 0 ? '+' : ''}${analysis.rootScoreLead.toFixed(1)} | ${Math.round(getAnimationNow() - analyzeT0)}ms (${reason})`);
-        releaseSearch();
         return;
       }
       if (analysis.rootVisits > lastReportVisits) {
@@ -777,7 +808,6 @@ async function handleMessage(msg: KataGoWorkerRequest): Promise<void> {
     const finalAnalysis = buildAnalysis();
     postAnalysis(finalAnalysis, 'katago:analyze_result');
     klog('analyze', `#${msg.id} done | visits: ${finalAnalysis.rootVisits} | wr: ${finalAnalysis.rootWinRate.toFixed(3)} | lead: ${finalAnalysis.rootScoreLead >= 0 ? '+' : ''}${finalAnalysis.rootScoreLead.toFixed(1)} | ${Math.round(getAnimationNow() - analyzeT0)}ms (time limit)`);
-    releaseSearch();
     });
   }
 }

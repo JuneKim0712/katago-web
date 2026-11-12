@@ -1,6 +1,6 @@
 import type { GameRules } from '../types/index.js';
 import { BLACK, PASS_MOVE, WHITE } from './fastBoard.js';
-import type { RecentMove } from './featuresV7Fast';
+import type { RecentMove } from './featuresV7Fast.js';
 
 /** Native BoardHistory::whiteBonusScore, normal play (not Japanese encore).
  * Count moves played, including captured stones, rather than stones remaining.

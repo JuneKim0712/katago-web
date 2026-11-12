@@ -9,7 +9,7 @@ import {
   parseTransformerAttention,
   parseTransformerFFN,
 } from './binModelParser.js';
-import type { ParsedKataGoModelV8 } from './modelV8';
+import type { ParsedKataGoModelV8 } from './modelV8.js';
 
 export function parseKataGoModelV8(data: Uint8Array): ParsedKataGoModelV8 {
   const p = new KataGoBinModelParser(data);

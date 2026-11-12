@@ -1,4 +1,4 @@
-import { OrtWebGpuSession } from '../inference/ort/session';
+import { OrtWebGpuSession } from '../inference/ort/session.js';
 
 export interface KatagoWasmModule {
   HEAPU8: Uint8Array;

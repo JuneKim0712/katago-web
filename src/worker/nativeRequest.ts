@@ -12,8 +12,8 @@ import {
   Point,
   Position,
   Rules,
-} from '../api/types';
-import { resolveRules } from '../api/validation';
+} from '../api/types.js';
+import { resolveRules } from '../api/validation.js';
 
 export interface NativeAllowMovesEntry {
   player: 'B' | 'W' | 'b' | 'w';
